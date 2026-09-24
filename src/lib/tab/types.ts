@@ -1,4 +1,8 @@
 export type TabNote = {
+	// Stable per-note identity, generated once when the note is created (on
+	// parse or via the authoring tools). Needed for edits — keying by
+	// time+midi+channel would break the moment you nudge a note in time.
+	id: string;
 	time: number; // seconds
 	duration: number; // seconds
 	stringIndex: number; // 0 = highest (thin) string, 5 = lowest (thick)
@@ -17,13 +21,18 @@ export type Articulation =
 	| { kind: 'bend'; semitones: number } // pitch (0 → +N), N ≤ ~5
 	| { kind: 'bendRelease'; semitones: number } // pitch (0 → +N → 0), N ≤ ~5
 	| { kind: 'graceSlide'; fromSemitones: number } // pitch (−N → 0 → −N), briefly touches notated fret from below
-	| { kind: 'harmonic'; semitones: number } // pitch offset ≥ ~6
+	| { kind: 'harmonic'; semitones: number; pinch?: boolean } // pitch offset ≥ ~6; pinch = pinch/artificial (shown as "P.H." instead of <n>)
 	| { kind: 'vibrato'; startTime: number; endTime: number } // absolute-time range where pressure is above threshold
 	| { kind: 'palmMute' }
 	| { kind: 'ghost' }
 	| { kind: 'hammerOn' }
 	| { kind: 'pullOff' }
-	| { kind: 'tap' };
+	| { kind: 'tap' }
+	// Note is "let ring" — playback keeps the pitch alive past the bar
+	// boundary (the default is to mute at bar end), and it's cut only by
+	// the next note fretted on the SAME string, mirroring real guitar
+	// physics.
+	| { kind: 'letRing' };
 
 export type Tab = {
 	notes: TabNote[];

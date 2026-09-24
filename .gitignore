@@ -24,3 +24,8 @@ vite.config.ts.timestamp-*
 
 *.dawproject
 *.mid
+# Local reference audio for testing
+/reference
+
+# Python environment for stem separation
+/.venv

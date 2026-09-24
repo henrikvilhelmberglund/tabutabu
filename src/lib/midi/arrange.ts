@@ -64,6 +64,7 @@ export function assignOne(
 	const context = recentContext(placed, n.time);
 	const best = pickBest(cands, context);
 	return {
+		id: newNoteId(),
 		time: n.time,
 		duration: n.duration,
 		stringIndex: best.stringIndex,
@@ -76,6 +77,15 @@ export function assignOne(
 			options.annotations?.[overrideKey(n.time, n.midi, n.channel)]
 		)
 	};
+}
+
+// Generate a note id. Prefer the platform's crypto.randomUUID when available
+// (all evergreen browsers and modern Node); fall back to a short random string
+// for older environments so tests still pass.
+export function newNoteId(): string {
+	const g = globalThis as unknown as { crypto?: { randomUUID?: () => string } };
+	if (g.crypto && typeof g.crypto.randomUUID === 'function') return g.crypto.randomUUID();
+	return 'n' + Math.random().toString(36).slice(2, 12);
 }
 
 function applyAnnotation(

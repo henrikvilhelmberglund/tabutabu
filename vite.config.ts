@@ -4,6 +4,11 @@ import UnoCSS from '@unocss/svelte-scoped/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+	server: {
+		// Not app code: the optional Python environment (tens of thousands of
+		// files) and local reference audio. Watching them costs CPU for nothing.
+		watch: { ignored: ['**/.venv/**', '**/reference/**'] }
+	},
 	plugins: [
 		UnoCSS({
 			injectReset: '@unocss/reset/tailwind.css'

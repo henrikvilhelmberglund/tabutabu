@@ -51,15 +51,15 @@ export const DEFAULT_RENDER_CONFIG: RenderConfig = {
 	barsPerPage: 1,
 	peekBeats: 0.5,
 	paddingX: 68,
-	// Vertical padding: leaves just enough space at the top for the bar-
-	// number labels (drawn at y=6, ~15px tall) and a small clearance line to
-	// the top string. Bottom is smaller because nothing draws below low-E.
-	paddingTop: 34,
+	// Vertical padding. Top has room for both the bar-number labels (top of
+	// the canvas) AND the palm-mute / let-ring rows (PM_LANE_OFFSET,
+	// LR_LANE_OFFSET above the top string). Bottom is
+	// smaller because nothing draws below low-E.
+	paddingTop: 50,
 	paddingBottom: 24,
 	showTuningLabel: true,
 	showNoteLengths: false
 };
-
 
 type Palette = {
 	bg: string;
@@ -80,6 +80,8 @@ type Palette = {
 	articulationActive: string;
 	palmMute: string;
 	playheadColumn: string;
+	// Author-mode hover preview of a note that isn't placed yet.
+	notePreview: string;
 };
 
 const PALETTE_DARK: Palette = {
@@ -103,7 +105,8 @@ const PALETTE_DARK: Palette = {
 	articulation: '#a0aebd',
 	articulationActive: '#ffffff',
 	palmMute: '#a0b0c4',
-	playheadColumn: 'rgba(255, 204, 85, 0.16)'
+	playheadColumn: 'rgba(255, 204, 85, 0.16)',
+	notePreview: '#5aa9ff'
 };
 
 const PALETTE_LIGHT: Palette = {
@@ -124,7 +127,8 @@ const PALETTE_LIGHT: Palette = {
 	articulation: '#0a0a0a',
 	articulationActive: '#0a0a0a',
 	palmMute: '#3a3f47',
-	playheadColumn: 'rgba(217, 119, 6, 0.18)'
+	playheadColumn: 'rgba(217, 119, 6, 0.18)',
+	notePreview: '#1d6fd1'
 };
 
 // Module-level "current" palette swapped at the top of renderTabFrame based on
@@ -132,6 +136,19 @@ const PALETTE_LIGHT: Palette = {
 // (drawStrings, drawNoteWithArticulations, etc.) don't need to be threaded
 // with a palette param.
 let COLORS: Palette = PALETTE_DARK;
+
+// Colours for the author-mode hover preview of a note that isn't placed yet.
+export function previewNoteColors(theme: Theme): { text: string; mask: string } {
+	const p = theme === 'light' ? PALETTE_LIGHT : PALETTE_DARK;
+	return { text: p.notePreview, mask: p.noteMask };
+}
+
+// Rows above the top string for the "PM" and "L.R." / "P.H." labels, given as
+// the distance from the top string up to the row's centre line. Each label
+// and its dashes share that centre line, so PM dashes can't cut into the
+// row below.
+export const PM_LANE_OFFSET = 25;
+export const LR_LANE_OFFSET = 12;
 
 export function renderTabFrame(
 	ctx: CanvasRenderingContext2D,
@@ -205,7 +222,7 @@ function renderPage(
 			ctx.font = '600 15px "JetBrains Mono Variable", ui-monospace, Menlo, Consolas, monospace';
 			ctx.textAlign = 'center';
 			ctx.textBaseline = 'top';
-			ctx.fillText(String(pageIndex * barsPerPage + i + 1), x, 6);
+			ctx.fillText(String(pageIndex * barsPerPage + i + 1), x, 3);
 			ctx.globalAlpha = 1;
 		}
 	}
@@ -455,6 +472,8 @@ function drawNotes(
 	// Palm-mute markers first (behind the digits): dashed line spanning above
 	// each contiguous run of PM notes on the top string.
 	drawPalmMuteMarkers(ctx, tab, cfg, timeToX, visible);
+	drawLetRingMarkers(ctx, tab, cfg, timeToX, visible);
+	drawPinchHarmonicMarkers(ctx, tab, cfg, timeToX, visible);
 
 	ctx.textBaseline = 'middle';
 
@@ -537,6 +556,27 @@ function drawNotes(
 	}
 }
 
+// Text drawn right after the fret digit, in order:
+//   [n]    pinch harmonic: where the picking hand catches it. The fretted
+//          note plus the harmonic interval, read as a (virtual) fret: 5[17]
+//          is an octave pinch harmonic picked 12 frets above the fret.
+//          Same convention as artificial harmonics.
+//   bN     bend to fret N; bNrM bend and release
+//   \N     grace slide back down
+function noteSuffix(n: import('./types').TabNote): string {
+	const arts = n.articulations ?? [];
+	let s = '';
+	const harmonic = arts.find((a) => a.kind === 'harmonic');
+	if (harmonic?.kind === 'harmonic' && harmonic.pinch) s += `[${n.fret + harmonic.semitones}]`;
+	for (const a of arts) {
+		if (a.kind === 'bend') s += `b${n.fret + a.semitones}`;
+		else if (a.kind === 'bendRelease') s += `b${n.fret + a.semitones}r${n.fret}`;
+	}
+	const grace = arts.find((a) => a.kind === 'graceSlide');
+	if (grace?.kind === 'graceSlide') s += `\\${Math.max(0, n.fret - grace.fromSemitones)}`;
+	return s;
+}
+
 // Renders one note as: [prefix][fret][suffix], with ghost/harmonic wrappers.
 // Left-aligned at the onset x. A same-colour rectangle underneath masks the
 // string line behind the glyphs. Active vs idle is colour-only — everything
@@ -557,6 +597,8 @@ function drawNoteWithArticulations(
 	pass: 'mask' | 'text'
 ): void {
 	void currentTime;
+	const textColor = active ? COLORS.noteTextActive : COLORS.noteTextIdle;
+	const decoColor = active ? COLORS.articulationActive : COLORS.articulation;
 	const arts = n.articulations ?? [];
 	const has = (kind: import('./types').Articulation['kind']) => arts.some((a) => a.kind === kind);
 
@@ -564,7 +606,9 @@ function drawNoteWithArticulations(
 	const harmonic = arts.find((a) => a.kind === 'harmonic');
 	let fretLabel = String(n.fret);
 	if (ghost) fretLabel = `(${fretLabel})`;
-	if (harmonic) fretLabel = `<${fretLabel}>`;
+	// Natural harmonics get <n>; pinch harmonics get a "P.H." label above
+	// the staff instead (drawPinchHarmonicMarkers).
+	if (harmonic && !harmonic.pinch) fretLabel = `<${fretLabel}>`;
 
 	const slideUp = arts.find((a) => a.kind === 'slideUp');
 	const slideDown = arts.find((a) => a.kind === 'slideDown');
@@ -593,10 +637,7 @@ function drawNoteWithArticulations(
 	else if (has('hammerOn') && !hpArc) prefix = 'h';
 	else if (has('pullOff') && !hpArc) prefix = 'p';
 
-	let suffix = '';
-	if (bend) suffix += `b${n.fret + bend.semitones}`;
-	else if (bendRelease) suffix += `b${n.fret + bendRelease.semitones}r${n.fret}`;
-	if (graceSlide) suffix += `\\${Math.max(0, n.fret - graceSlide.fromSemitones)}`;
+	const suffix = noteSuffix(n);
 
 	// Same font size for fret and decor. Active vs idle differs by weight
 	// and colour only.
@@ -642,13 +683,13 @@ function drawNoteWithArticulations(
 		ctx.globalAlpha = savedAlpha;
 	} else {
 		if (prefix) {
-			ctx.fillStyle = active ? COLORS.articulationActive : COLORS.articulation;
+			ctx.fillStyle = decoColor;
 			ctx.fillText(prefix, prefixStartX, y);
 		}
-		ctx.fillStyle = active ? COLORS.noteTextActive : COLORS.noteTextIdle;
+		ctx.fillStyle = textColor;
 		ctx.fillText(fretLabel, fretStartX, y);
 		if (suffix) {
-			ctx.fillStyle = active ? COLORS.articulationActive : COLORS.articulation;
+			ctx.fillStyle = decoColor;
 			ctx.fillText(suffix, suffixStartX, y);
 		}
 	}
@@ -667,20 +708,8 @@ function drawNoteWithArticulations(
 		const prevFretStr = String(prevOnString.fret);
 		const prevFretW = ctx.measureText(prevFretStr).width;
 		ctx.font = decorFont;
-		const prevArts = prevOnString.articulations ?? [];
-		let prevSuffixW = 0;
-		for (const a of prevArts) {
-			if (a.kind === 'bend')
-				prevSuffixW += ctx.measureText(`b${prevOnString.fret + a.semitones}`).width;
-			else if (a.kind === 'bendRelease')
-				prevSuffixW += ctx.measureText(
-					`b${prevOnString.fret + a.semitones}r${prevOnString.fret}`
-				).width;
-			else if (a.kind === 'graceSlide')
-				prevSuffixW += ctx.measureText(
-					`\\${Math.max(0, prevOnString.fret - a.fromSemitones)}`
-				).width;
-		}
+		const prevSuffix = noteSuffix(prevOnString);
+		const prevSuffixW = prevSuffix ? ctx.measureText(prevSuffix).width : 0;
 		const prevX = timeToX(prevOnString.time) + prevFretW / 2 + prevSuffixW + 2;
 		const endX = prefixStartX - 2;
 		const gap = endX - prevX;
@@ -706,14 +735,14 @@ function drawNoteWithArticulations(
 				if (!isInline) {
 					// Arc + letter above/below the string.
 					const midY = y + (isHammer ? -14 : 14);
-					ctx.strokeStyle = active ? COLORS.articulationActive : COLORS.articulation;
+					ctx.strokeStyle = decoColor;
 					ctx.lineWidth = 1.3;
 					ctx.beginPath();
 					ctx.moveTo(prevX, y - (isHammer ? 4 : -4));
 					ctx.quadraticCurveTo(midX, midY, endX, y - (isHammer ? 4 : -4));
 					ctx.stroke();
 					ctx.font = decorFont;
-					ctx.fillStyle = active ? COLORS.articulationActive : COLORS.articulation;
+					ctx.fillStyle = decoColor;
 					ctx.textAlign = 'center';
 					ctx.textBaseline = 'middle';
 					ctx.fillText(letter, midX, midY + (isHammer ? -1 : 1));
@@ -722,7 +751,7 @@ function drawNoteWithArticulations(
 				} else {
 					// Inline letter — mask already drawn in the mask pass.
 					ctx.font = decorFont;
-					ctx.fillStyle = active ? COLORS.articulationActive : COLORS.articulation;
+					ctx.fillStyle = decoColor;
 					ctx.textAlign = 'center';
 					ctx.textBaseline = 'middle';
 					ctx.fillText(letter, midX, y);
@@ -747,7 +776,7 @@ function drawNoteWithArticulations(
 		const startY = y - 11;
 		const endX = centerX + (width * 3) / 4;
 		const endY = startY - height;
-		ctx.strokeStyle = active ? COLORS.articulationActive : COLORS.articulation;
+		ctx.strokeStyle = decoColor;
 		ctx.lineWidth = 1.3;
 		ctx.beginPath();
 		ctx.moveTo(startX, startY);
@@ -768,7 +797,7 @@ function drawNoteWithArticulations(
 		const lineX0 = prefixStartX + prefixW + 2;
 		const lineX1 = fretStartX - 2;
 		if (lineX1 > lineX0 + 2) {
-			ctx.strokeStyle = active ? COLORS.articulationActive : COLORS.articulation;
+			ctx.strokeStyle = decoColor;
 			ctx.lineWidth = 1.2;
 			ctx.beginPath();
 			if (slideUp) {
@@ -798,7 +827,7 @@ function drawNoteWithArticulations(
 		const period = 22;
 		const cycles = Math.max(1, (vEnd - vStart) / period);
 		const samples = Math.max(8, Math.round(cycles * 10));
-		ctx.strokeStyle = active ? COLORS.articulationActive : COLORS.articulation;
+		ctx.strokeStyle = decoColor;
 		ctx.lineWidth = 1.2;
 		ctx.beginPath();
 		for (let i = 0; i <= samples; i++) {
@@ -822,35 +851,54 @@ function drawPalmMuteMarkers(
 	visible: (n: (typeof tab.notes)[number]) => boolean
 ): void {
 	const GAP = 0.35; // seconds; larger gaps between PM notes break the marker
-	const y = cfg.paddingTop - 18;
+	const y = cfg.paddingTop - PM_LANE_OFFSET;
+
+	// PM span: label anchored at the first PM note's centre; dashes trail
+	// just a short amount past the LAST PM note in the run (not the note's
+	// duration, so a 1/8-note PM doesn't paint dashes across two 16ths).
+	// If a non-PM note follows within that trail, we cap the dashes just
+	// before it so the following note doesn't look palm-muted.
+	const TAIL = 0.05; // seconds of dashes past the last PM note
+	const INTERRUPT_GAP = 0.03; // seconds of clearance before an interrupter
 
 	let inRun = false;
 	let runStart = 0;
-	let runEnd = 0;
+	let lastPMTime = 0;
+	let interrupterTime: number | null = null;
+
 	const flush = () => {
 		if (!inRun) return;
+		let end = lastPMTime + TAIL;
+		if (interrupterTime !== null) {
+			end = Math.min(end, interrupterTime - INTERRUPT_GAP);
+		}
+		end = Math.max(runStart + 0.02, end);
 		const x1 = timeToX(runStart);
-		const x2 = timeToX(runEnd);
-		ctx.strokeStyle = COLORS.palmMute;
-		ctx.setLineDash([3, 4]);
-		ctx.lineWidth = 1.2;
-		ctx.beginPath();
-		ctx.moveTo(x1, y);
-		ctx.lineTo(x2, y);
-		ctx.stroke();
-		ctx.setLineDash([]);
+		const x2 = timeToX(end);
 		ctx.fillStyle = COLORS.palmMute;
 		ctx.font = '700 14px "JetBrains Mono Variable", ui-monospace, Menlo, Consolas, monospace';
-		ctx.textAlign = 'left';
-		ctx.textBaseline = 'bottom';
-		ctx.fillText('PM', x1, y - 2);
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'middle';
+		ctx.fillText('PM', x1, y);
+		const labelW = ctx.measureText('PM').width;
+		const dashStart = x1 + labelW / 2 + 4;
+		if (x2 > dashStart + 2) {
+			ctx.strokeStyle = COLORS.palmMute;
+			ctx.setLineDash([3, 4]);
+			ctx.lineWidth = 1.2;
+			ctx.beginPath();
+			ctx.moveTo(dashStart, y);
+			ctx.lineTo(x2, y);
+			ctx.stroke();
+			ctx.setLineDash([]);
+		}
 		inRun = false;
+		interrupterTime = null;
 	};
 
 	// Notes are sorted by time in the Tab.
 	for (const n of tab.notes) {
 		if (!visible(n)) {
-			// Once we're past the visible window we can stop.
 			if (n.time > (tab.notes[tab.notes.length - 1]?.time ?? 0)) break;
 			continue;
 		}
@@ -859,18 +907,85 @@ function drawPalmMuteMarkers(
 			if (!inRun) {
 				inRun = true;
 				runStart = n.time;
-				runEnd = n.time + Math.max(n.duration, 0.05);
-			} else if (n.time - runEnd < GAP) {
-				runEnd = Math.max(runEnd, n.time + Math.max(n.duration, 0.05));
+				lastPMTime = n.time;
+			} else if (n.time - lastPMTime < GAP) {
+				lastPMTime = n.time;
 			} else {
 				flush();
 				inRun = true;
 				runStart = n.time;
-				runEnd = n.time + Math.max(n.duration, 0.05);
+				lastPMTime = n.time;
 			}
-		} else {
+		} else if (inRun) {
+			// A non-PM note breaks the run and clips its trailing dashes.
+			interrupterTime = n.time;
 			flush();
 		}
 	}
 	flush();
+}
+
+// Pinch/artificial harmonic: "P.H." above the staff at the note (the fret
+// digit itself stays plain, since <n> would claim a natural harmonic).
+function drawPinchHarmonicMarkers(
+	ctx: CanvasRenderingContext2D,
+	tab: Tab,
+	cfg: RenderConfig,
+	timeToX: (t: number) => number,
+	visible: (n: (typeof tab.notes)[number]) => boolean
+): void {
+	let lastX = -Infinity;
+	for (const n of tab.notes) {
+		if (!visible(n)) continue;
+		const h = n.articulations?.find((a) => a.kind === 'harmonic');
+		if (!h || h.kind !== 'harmonic' || !h.pinch) continue;
+		const x = timeToX(n.time);
+		// One label per time position even if several strings are pinched.
+		if (Math.abs(x - lastX) < 1) continue;
+		lastX = x;
+		// Shares the L.R. row; moves up to the PM row when the same time
+		// also lets ring, so the two labels never collide.
+		const ringsToo = n.articulations.some((a) => a.kind === 'letRing');
+		const y = cfg.paddingTop - (ringsToo ? PM_LANE_OFFSET : LR_LANE_OFFSET);
+		ctx.fillStyle = COLORS.articulation;
+		ctx.font = '700 12px "JetBrains Mono Variable", ui-monospace, Menlo, Consolas, monospace';
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'middle';
+		ctx.fillText('P.H.', x, y);
+	}
+}
+
+// Let-ring marker: same visual language as PM ("L.R." label + short trailing
+// dashed line above the tab) but a distinct colour so the two don't get
+// confused. Drawn per note — no "run" merging, since a let-ring is really a
+// property of the individual note rather than a span like palm mute.
+function drawLetRingMarkers(
+	ctx: CanvasRenderingContext2D,
+	tab: Tab,
+	cfg: RenderConfig,
+	timeToX: (t: number) => number,
+	visible: (n: (typeof tab.notes)[number]) => boolean
+): void {
+	const y = cfg.paddingTop - LR_LANE_OFFSET;
+	for (const n of tab.notes) {
+		if (!visible(n)) continue;
+		if (!n.articulations?.some((a) => a.kind === 'letRing')) continue;
+		const x = timeToX(n.time);
+		ctx.fillStyle = '#c69f5e';
+		ctx.font = '700 12px "JetBrains Mono Variable", ui-monospace, Menlo, Consolas, monospace';
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'middle';
+		ctx.fillText('L.R.', x, y);
+		const labelW = ctx.measureText('L.R.').width;
+		const dashStart = x + labelW / 2 + 4;
+		const dashEnd = dashStart + 20;
+		ctx.strokeStyle = '#c69f5e';
+		ctx.setLineDash([3, 4]);
+		ctx.lineWidth = 1.2;
+		ctx.beginPath();
+		ctx.moveTo(dashStart, y);
+		ctx.lineTo(dashEnd, y);
+		ctx.stroke();
+		ctx.setLineDash([]);
+	}
 }
