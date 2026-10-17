@@ -5,6 +5,8 @@
 	import { inspectMidi, type MidiInspection } from '$lib/midi/expressions';
 	import {
 		renderTabFrame,
+		tabLayout,
+		type TabLayout,
 		DEFAULT_RENDER_CONFIG,
 		PM_LANE_OFFSET,
 		previewNoteColors,
@@ -41,6 +43,21 @@
 		type Voicing
 	} from '$lib/tab/chords';
 	import { PitchProbe } from '$lib/audio/probe';
+	import { findSongStart } from '$lib/audio/beat-align';
+	import { metronomeBarMidi, tabToMidi } from '$lib/midi/export';
+	import {
+		barAt,
+		barInfo,
+		barBeat,
+		barCount,
+		gridStepAt,
+		snapToGrid,
+		stepGrid,
+		tempoChanges,
+		quartersToTime,
+		warpTime,
+		type TempoChange
+	} from '$lib/tab/tempo';
 	import { ChannelRouter, type ListenChannel } from '$lib/audio/channels';
 	import { encodeShare, decodeShare, fetchGistPayload, type SharedTab } from '$lib/tab/share';
 	import {
@@ -48,6 +65,7 @@
 		drawSpectrogramSpan,
 		spectrogramFromData,
 		spectrogramPitchRange,
+		decodeReference,
 		SPECTROGRAM_VERSION,
 		type Spectrogram,
 		type SpectrogramData,
@@ -77,7 +95,7 @@
 		cmdRemoveNote,
 		cmdUpdateNote,
 		cmdReconcileHammerPull,
-		cmdSetTempo,
+		cmdSetTempoMap,
 		shiftTimedArticulations,
 		batchCommand,
 		type Command,
@@ -243,6 +261,10 @@
 				// or the last chord key pressed mid-drag). Dragging moves that shape
 				// in parallel while it stays playable.
 				anchorFret: number;
+				// Power-chord tools: the shape at drag start and now (vertical
+				// drag steps through the shapes); null elsewhere.
+				shapeStart: string | null;
+				shapeNow: string | null;
 		  }
 		| {
 				kind: 'edit';
@@ -261,6 +283,10 @@
 				// string count and variation number instead of being shifted,
 				// so open-string shapes stay playable.
 				chord: ChordId | null;
+				// Power-chord tools, dragging a chord's root: its shape at drag
+				// start and now (vertical drag steps through the shapes).
+				shapeStart: string | null;
+				shapeNow: string | null;
 		  }
 		| {
 				// Alt+drag: reposition to another string while preserving MIDI
@@ -336,7 +362,9 @@
 	// less twitchy than the vertical octave gesture — you want room to land
 	// on a specific fret, but octave jumps only need coarse throws.
 	const PX_PER_FRET = 18;
-	const PX_PER_OCTAVE = 40;
+	const PX_PER_OCTAVE = 80;
+	// … and per power-chord shape step (vertical, power-chord tools).
+	const PX_PER_SHAPE = 40;
 
 	// Remember what pitch the drag last auditioned so we don't retrigger the
 	// preview every frame; only when the fret / string / midi actually
@@ -405,6 +433,22 @@
 	// 0..1 — volume of the reference video/audio when its audio track is
 	// enabled. Bound to `videoElement.volume` via an effect below.
 	let videoVolume = $state(0.8);
+	// Mute the reference (and its stems) while this window isn't focused —
+	// e.g. while playing along in a DAW that has the audio too. Persisted.
+	let muteRefInBackground = $state(false);
+	let windowFocused = $state(typeof document === 'undefined' ? true : document.hasFocus());
+	let refBackgroundMuted = $derived(muteRefInBackground && !windowFocused);
+	onMount(() => {
+		const on = () => (windowFocused = true);
+		const off = () => (windowFocused = false);
+		window.addEventListener('focus', on);
+		window.addEventListener('blur', off);
+		windowFocused = document.hasFocus();
+		return () => {
+			window.removeEventListener('focus', on);
+			window.removeEventListener('blur', off);
+		};
+	});
 	let videoElement = $state<HTMLVideoElement | null>(null);
 	let videoDuration = $state<number | null>(null);
 	// Composite canvas: shows video + tab overlay both during preview (WYSIWYG)
@@ -507,9 +551,36 @@
 	let referenceKey = '';
 	let spectroJob = 0;
 
-	function setReferenceAudio(buffer: ArrayBuffer | null, type = '', name = '') {
+	// Each reference file keeps its own offset (by name + size). A new file
+	// starts at 0; the file restored on load keeps the offset that was in use
+	// (from before offsets were remembered per file) unless it has its own.
+	const OFFSETS_KEY = 'tabutabu.referenceOffsets';
+	function savedOffsets(): Record<string, number> {
+		try {
+			return JSON.parse(localStorage.getItem(OFFSETS_KEY) ?? '{}') ?? {};
+		} catch {
+			return {};
+		}
+	}
+	$effect(() => {
+		const offset = videoOffsetSec;
+		const key = untrack(() => referenceKey);
+		if (!key) return;
+		try {
+			localStorage.setItem(OFFSETS_KEY, JSON.stringify({ ...savedOffsets(), [key]: offset }));
+		} catch {
+			// not remembered
+		}
+	});
+
+	function setReferenceAudio(buffer: ArrayBuffer | null, type = '', name = '', restoring = false) {
 		referenceBuffer = buffer;
 		referenceKey = buffer ? `${name}|${buffer.byteLength}` : '';
+		if (buffer) {
+			const own = savedOffsets()[referenceKey];
+			if (typeof own === 'number' && Number.isFinite(own)) videoOffsetSec = own;
+			else if (!restoring) videoOffsetSec = 0;
+		}
 		probe.forget();
 		probeMidi = null;
 		hoverMidi = null;
@@ -717,6 +788,10 @@
 		const at = spectroAt(e);
 		if (!at) return;
 		e.preventDefault();
+		if (e.altKey) {
+			addNoteFromSpectrogram(at.refTime, at.midi);
+			return;
+		}
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		// One thing at a time: the probe replaces normal playback.
 		if (playing) {
@@ -835,8 +910,8 @@
 		if (tab) {
 			ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
 			ctx.lineWidth = 1;
-			for (let b = Math.floor(t0 / tab.secondsPerBar); b * tab.secondsPerBar <= t1; b++) {
-				const x = Math.round(timeToX(b * tab.secondsPerBar)) + 0.5;
+			for (let b = barAt(tab, t0).index; barInfo(tab, b).start <= t1; b++) {
+				const x = Math.round(timeToX(barInfo(tab, b).start)) + 0.5;
 				ctx.beginPath();
 				ctx.moveTo(x, 0);
 				ctx.lineTo(x, h);
@@ -934,6 +1009,7 @@
 	const synth = new Synth();
 	$effect(() => synth.setVolume(volume));
 	$effect(() => synth.setMetronome(metronomeOn, metronomeVol));
+	$effect(() => synth.setPlaybackEnd(effectiveDurationSec));
 	// Push the videoVolume slider through to the actual media element — or,
 	// once it's routed for channel listening (L / R), to its router.
 	$effect(() => {
@@ -943,7 +1019,7 @@
 		const router = ch !== 'both' ? ChannelRouter.for(el) : ChannelRouter.existing(el);
 		if (router) {
 			router.setChannel(ch);
-			router.setLevel(videoAudioOn && !stemPlaying ? videoVolume : 0);
+			router.setLevel(videoAudioOn && !stemPlaying && !refBackgroundMuted ? videoVolume : 0);
 		} else {
 			el.volume = Math.max(0, Math.min(1, videoVolume));
 		}
@@ -1011,6 +1087,12 @@
 	// Keep SPP conversion accurate when a new tab is loaded (its BPM may differ).
 	$effect(() => {
 		if (tab) dawSync.setTempo(tab.bpm);
+		// Song position through the tempo map (changes in tempo / time
+		// signature), so a DAW position after a change lands in the right bar.
+		const t = tab;
+		dawSync.positionToSeconds = t?.tempoMap
+			? (sixteenths) => quartersToTime(t, sixteenths / 4)
+			: null;
 	});
 	$effect(() => {
 		dawSync.preservePositionOnStart = preservePositionOnStart;
@@ -1121,6 +1203,48 @@
 		if (!file) return;
 		const buf = await file.arrayBuffer();
 		await loadFileFromBuffer(buf, file.name, true);
+	}
+
+	// The tab's notes and tempo map as a MIDI file (bar 1 at its start), e.g.
+	// to bring the bar structure into a DAW.
+	function exportMidi(metronome = false) {
+		if (!tab) return;
+		const name = (videoFileName ?? fileName ?? 'tab').replace(/.[^.]+$/, '');
+		const bar = barInfo(tab, selectedBar());
+		const bytes = metronome
+			? metronomeBarMidi([...bar.timeSignature], bar.bpm, `${name} metronome`)
+			: tabToMidi($state.snapshot(tab) as Tab, name);
+		const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: 'audio/midi' }));
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = metronome
+			? `${name} - metronome ${bar.timeSignature[0]}-${bar.timeSignature[1]}.mid`
+			: `${name} - tempo map.mid`;
+		a.click();
+		setTimeout(() => URL.revokeObjectURL(url), 1000);
+	}
+
+	// Offset from the audio: tab time 0 goes on the song's first clear hit.
+	let autoOffsetState = $state<'idle' | 'busy' | 'failed'>('idle');
+	async function autoOffset() {
+		const buffer = referenceBuffer;
+		if (!buffer || autoOffsetState === 'busy') return;
+		autoOffsetState = 'busy';
+		try {
+			const { audio } = await decodeReference(buffer);
+			const l = audio.getChannelData(0);
+			const r = audio.getChannelData(1);
+			const mono = new Float32Array(l.length);
+			for (let i = 0; i < l.length; i++) mono[i] = (l[i] + r[i]) / 2;
+			// Let the button show it's working before the busy part.
+			await new Promise((res) => setTimeout(res, 0));
+			const start = findSongStart(mono, audio.sampleRate);
+			if (start === null) throw new Error('no clear start found');
+			videoOffsetSec = Math.round(start * 1000) / 1000;
+			autoOffsetState = 'idle';
+		} catch {
+			autoOffsetState = 'failed';
+		}
 	}
 
 	async function onVideoFile(event: Event) {
@@ -1771,32 +1895,94 @@
 		tapTimes = [];
 	}
 
-	// Apply the currently-estimated tap BPM to the loaded tab. Updates the
-	// derived seconds-per-bar so the renderer / grid / focus / playback all
-	// pick up the new tempo. Note times themselves are absolute (seconds)
-	// and don't shift — the goal is to line the bar grid up with the
-	// audible downbeats of the reference video/audio.
+	// Apply the tap estimate as the selected section's tempo.
 	function applyTapBpm() {
 		if (!tab || tapBpm === null) return;
-		const clamped = Math.max(20, Math.min(400, tapBpm));
-		const beats = tab.timeSignature[0];
-		const newSecondsPerBar = beats * (60 / clamped);
-		tab.bpm = clamped;
-		tab.secondsPerBar = newSecondsPerBar;
-		tab = tab;
+		setTempo(tapBpm);
 		tapTimes = [];
 	}
 
-	// Typed tempo: notes keep their place in the bar (they move with the
-	// grid), and so does the playhead. Undoable.
+	// ---- Tempo sections -------------------------------------------------------
+	// The tempo / time signature shown and edited is the one of the selected
+	// bar's section (author focus; the playhead's bar elsewhere).
+	function selectedBar(): number {
+		if (!tab) return 0;
+		return mode === 'author' ? authorFocus.barIdx : barAt(tab, currentTime).index;
+	}
+	let selectedSection = $derived.by(() => {
+		if (!tab) return null;
+		void tab.tempoMap;
+		void tab.bpm;
+		const bar = mode === 'author' ? authorFocus.barIdx : barAt(tab, currentTime).index;
+		const info = barInfo(tab, bar);
+		const changes = tempoChanges(tab);
+		return {
+			bar,
+			index: info.section,
+			startBar: changes[info.section].bar,
+			bpm: info.bpm,
+			timeSignature: info.timeSignature,
+			count: changes.length
+		};
+	});
+
+	// Replace the tempo map: notes keep their bar and position in it, and so
+	// does the playhead. Undoable.
+	function applyTempoMap(map: TempoChange[]) {
+		if (!tab) return;
+		const before = {
+			bpm: tab.bpm,
+			timeSignature: tab.timeSignature,
+			secondsPerBar: tab.secondsPerBar,
+			tempoMap: tempoChanges(tab).map((c) => ({ ...c }))
+		};
+		commitEdit(cmdSetTempoMap(map));
+		currentTime = warpTime(before, tab, currentTime);
+		if (playing && audioOn) synthRestart(currentTime);
+	}
+
+	// Typed tempo for the selected section.
 	function setTempo(value: number) {
 		if (!tab || !Number.isFinite(value)) return;
 		const bpm = Math.max(20, Math.min(400, value));
-		if (Math.abs(bpm - tab.bpm) < 1e-9) return;
-		const k = tab.bpm / bpm;
-		commitEdit(cmdSetTempo(bpm));
-		currentTime *= k;
-		if (playing && audioOn) synthRestart(currentTime);
+		const map = tempoChanges(tab).map((c) => ({ ...c }));
+		const i = barInfo(tab, selectedBar()).section;
+		if (Math.abs(map[i].bpm - bpm) < 1e-9) return;
+		map[i] = { ...map[i], bpm };
+		applyTempoMap(map);
+	}
+
+	// Time signature for the selected section.
+	function setTimeSignature(top: number, bottom: number) {
+		if (!tab) return;
+		const num = Math.max(1, Math.min(32, Math.round(top)));
+		const den = [1, 2, 4, 8, 16, 32].includes(bottom) ? bottom : 4;
+		const map = tempoChanges(tab).map((c) => ({ ...c }));
+		const i = barInfo(tab, selectedBar()).section;
+		const ts = map[i].timeSignature;
+		if (ts[0] === num && ts[1] === den) return;
+		map[i] = { ...map[i], timeSignature: [num, den] };
+		applyTempoMap(map);
+	}
+
+	// A new section from the selected bar (starting like the one it splits).
+	function addTempoChange() {
+		if (!tab) return;
+		const bar = selectedBar();
+		const map = tempoChanges(tab).map((c) => ({ ...c }));
+		if (bar === 0 || map.some((c) => c.bar === bar)) return;
+		const info = barInfo(tab, bar);
+		map.push({ bar, bpm: info.bpm, timeSignature: [...info.timeSignature] });
+		applyTempoMap(map);
+	}
+
+	// Remove the section starting at the selected bar (it joins the previous).
+	function removeTempoChange() {
+		if (!tab) return;
+		const bar = selectedBar();
+		const map = tempoChanges(tab).filter((c) => c.bar !== bar || c.bar === 0);
+		if (map.length === tempoChanges(tab).length) return;
+		applyTempoMap(map);
 	}
 
 	function tapTempo() {
@@ -1938,19 +2124,84 @@
 		if (redoCmd(tab, history)) tab = tab;
 	}
 
+	// Ctrl+D: copy the focused bar's notes into the next bar (replacing what's
+	// there), then focus that bar — so pressing it again keeps copying on.
+	function duplicateBar() {
+		if (!tab) return;
+		const clip = barNotes(authorFocus.barIdx);
+		if (!clip) return;
+		pasteNotes(clip, authorFocus.barIdx + 1, 'Duplicate bar');
+		authorFocus = { barIdx: authorFocus.barIdx + 1, beatIdx: 0 };
+		syncPlayheadToFocus();
+	}
+
+	// Ctrl+C / Ctrl+V: copy the focused bar, paste it over the focused bar.
+	// Notes keep their position in the bar counted in quarter notes, so a
+	// tempo change (or another bar's tempo) still lands them on their beats.
+	type BarClip = { notes: TabNote[]; start: number; quarter: number };
+	let barClipboard: BarClip | null = null;
+
+	function barNotes(barIdx: number): BarClip | null {
+		if (!tab) return null;
+		const bar = barInfo(tab, barIdx);
+		return {
+			notes: tab.notes
+				.filter((n) => n.time >= bar.start - 1e-6 && n.time < bar.start + bar.length - 1e-6)
+				.map((n) => $state.snapshot(n) as TabNote),
+			start: bar.start,
+			quarter: 60 / bar.bpm
+		};
+	}
+
+	function copyBar() {
+		barClipboard = barNotes(authorFocus.barIdx);
+	}
+
+	function pasteBar() {
+		if (barClipboard) pasteNotes(barClipboard, authorFocus.barIdx, 'Paste bar');
+	}
+
+	// Put `clip` into bar `barIdx`, replacing what's there.
+	function pasteNotes(clip: BarClip, barIdx: number, label: string) {
+		if (!tab) return;
+		const bar = barInfo(tab, barIdx);
+		const start = bar.start;
+		const len = bar.length;
+		const k = 60 / bar.bpm / clip.quarter;
+		const place = (t: number) => start + (t - clip.start) * k;
+		const replaced = tab.notes.filter((n) => n.time >= start - 1e-6 && n.time < start + len - 1e-6);
+		const pasted: TabNote[] = clip.notes.map((n) => ({
+			...n,
+			id: newNoteId(),
+			time: place(n.time),
+			duration: n.duration * k,
+			articulations: n.articulations.map((a) =>
+				a.kind === 'vibrato'
+					? { ...a, startTime: place(a.startTime), endTime: place(a.endTime) }
+					: a
+			)
+		}));
+		const extend = extendDurationTo(tab, start + len);
+		commitEdit(
+			batchCommand(label, [
+				...(extend ? [extend] : []),
+				...replaced.map((n) => cmdRemoveNote(n.id)),
+				...pasted.map((n) => cmdAddNote(n))
+			])
+		);
+	}
+
 	// Derive the [start, end) time range of the current author focus.
 	function authorFocusRange(): { start: number; end: number } {
 		if (!tab) return { start: 0, end: 0 };
-		const beats = tab.timeSignature[0];
-		const secondsPerBeat = tab.secondsPerBar / beats;
-		const barStart = authorFocus.barIdx * tab.secondsPerBar;
+		const bar = barInfo(tab, authorFocus.barIdx);
 		if (authorFocus.beatIdx === 0) {
-			return { start: barStart, end: barStart + tab.secondsPerBar };
+			return { start: bar.start, end: bar.start + bar.length };
 		}
-		const beat = Math.max(1, Math.min(beats, authorFocus.beatIdx));
+		const beat = Math.max(1, Math.min(bar.beats, authorFocus.beatIdx));
 		return {
-			start: barStart + (beat - 1) * secondsPerBeat,
-			end: barStart + beat * secondsPerBeat
+			start: bar.start + (beat - 1) * bar.beatLength,
+			end: bar.start + beat * bar.beatLength
 		};
 	}
 
@@ -1966,10 +2217,9 @@
 	// bar → beat 1 → beat 2 → ... → beat N → next bar's "bar" scope → ...
 	function authorAdvanceFocus(dir: 1 | -1): void {
 		if (!tab) return;
-		const beats = tab.timeSignature[0];
 		let { barIdx, beatIdx } = authorFocus;
 		if (dir > 0) {
-			if (beatIdx < beats) beatIdx += 1;
+			if (beatIdx < barInfo(tab, barIdx).beats) beatIdx += 1;
 			else {
 				barIdx += 1;
 				beatIdx = 0;
@@ -1978,7 +2228,7 @@
 			if (beatIdx > 0) beatIdx -= 1;
 			else if (barIdx > 0) {
 				barIdx -= 1;
-				beatIdx = beats;
+				beatIdx = barInfo(tab, barIdx).beats;
 			}
 		}
 		authorFocus = { barIdx, beatIdx };
@@ -1989,71 +2239,146 @@
 	// and run all the way to the end of the tab (no bar/beat auto-stop).
 	// Useful for auditioning the whole piece against the reference video.
 	// Shift+Space: play through like Ctrl+Space, but hear the selected
-	// instrument stem instead of the reference (whose own audio is muted
-	// meanwhile). Without a stem selected, it's the same as Ctrl+Space.
-	let stemAudio: { key: string; url: string; el: HTMLAudioElement } | null = null;
+	// source — an instrument stem instead of the reference (whose own audio
+	// is muted meanwhile), or the whole song for Mix / Sides. All stems play
+	// together, silent except the selected one, so switching the source while
+	// it plays is instant and they all stay in step with the tab.
+	type StemPlayer = { url: string; el: HTMLAudioElement };
+	let stemPlayers: { id: string; players: Map<StemSource, StemPlayer> } | null = null;
+	// A stem (rather than the reference) is what's heard right now.
 	let stemPlaying = $state(false);
+	// Playback started with Shift+Space (follows the source until it stops).
+	let stemMode = $state(false);
+	// Keeping stems in step with the reference's own player (so switching
+	// between Mix and a stem lands on the same moment) — or the tab when that
+	// isn't running: lined up once they're actually running, then only
+	// pulled back if they drift more than STEM_DRIFT
+	// seconds, at most once per STEM_FIX_GAP seconds each (every jump is a
+	// tiny audible skip, so they must be rare).
+	const STEM_DRIFT = 0.12;
+	const STEM_FIX_GAP = 1;
+	const stemLastFix = new WeakMap<HTMLAudioElement, number>();
+	// Last level / channel given to each player (only changes are applied).
+	const stemApplied = new WeakMap<HTMLAudioElement, string>();
 
 	function dropStemAudio() {
-		if (!stemAudio) return;
-		stemAudio.el.pause();
-		URL.revokeObjectURL(stemAudio.url);
-		stemAudio = null;
+		if (!stemPlayers) return;
+		for (const p of stemPlayers.players.values()) {
+			p.el.pause();
+			URL.revokeObjectURL(p.url);
+		}
+		stemPlayers = null;
 		stemPlaying = false;
+		stemMode = false;
+	}
+
+	// A player per stem of the current split (made once, then reused).
+	async function prepareStemPlayers(): Promise<Map<StemSource, StemPlayer> | null> {
+		if (!stems || stems.status !== 'done') return null;
+		if (stemPlayers?.id === stems.id) return stemPlayers.players;
+		dropStemAudio();
+		const id = stems.id;
+		let buffers: ArrayBuffer[];
+		try {
+			buffers = await Promise.all(STEM_SOURCES.map((s) => getStem(s)));
+		} catch {
+			return null;
+		}
+		if (stems?.id !== id) return null;
+		const players = new Map<StemSource, StemPlayer>();
+		STEM_SOURCES.forEach((s, i) => {
+			const url = URL.createObjectURL(new Blob([buffers[i]], { type: 'audio/ogg' }));
+			const el = new Audio(url);
+			el.preload = 'auto';
+			players.set(s, { url, el });
+		});
+		stemPlayers = { id, players };
+		return players;
 	}
 
 	async function authorPlayThroughStem() {
 		if (!tab) return;
-		const source = effectiveSource;
-		if (playing || !isStem(source) || !stems) {
+		if (playing) {
 			authorPlayThrough();
 			return;
 		}
-		let buffer: ArrayBuffer;
-		try {
-			buffer = await getStem(source);
-		} catch {
-			authorPlayThrough();
-			return;
+		const players = await prepareStemPlayers();
+		stemMode = true;
+		if (players) {
+			ChannelRouter.resume();
+			const target = Math.max(0, currentTime + videoOffsetSec);
+			for (const [s, p] of players) {
+				p.el.currentTime = target;
+				setStemLevel(s, p.el);
+				// Starting takes a moment: once it really runs, line it up
+				// with the tab exactly.
+				p.el.addEventListener(
+					'playing',
+					() => {
+						if (!stemMode) return;
+						p.el.currentTime = stemTarget();
+						stemLastFix.set(p.el, performance.now());
+					},
+					{ once: true }
+				);
+				void p.el.play().catch(() => {});
+			}
 		}
-		const key = `${stems.id}:${source}`;
-		if (stemAudio?.key !== key) {
-			dropStemAudio();
-			const url = URL.createObjectURL(new Blob([buffer], { type: 'audio/ogg' }));
-			stemAudio = { key, url, el: new Audio(url) };
-		}
-		const el = stemAudio!.el;
-		setStemLevel(el);
-		ChannelRouter.resume();
-		el.currentTime = Math.max(0, currentTime + videoOffsetSec);
-		stemPlaying = true;
-		void el.play().catch(() => (stemPlaying = false));
+		stemPlaying = !!players && isStem(effectiveSource);
 		authorPlayThrough();
 	}
 
-	// Called every frame: keep the stem with the tab clock, and stop it
-	// whenever playback stops (however that happens).
+	// Called every frame: keep the stems with the tab clock, let only the
+	// selected one be heard, and stop them when playback stops (however that
+	// happens).
 	function syncStem() {
-		if (!stemPlaying || !stemAudio) return;
-		const el = stemAudio.el;
+		if (!stemMode) return;
+		const players = stemPlayers?.players;
 		if (!playing) {
-			el.pause();
+			if (players) for (const p of players.values()) p.el.pause();
+			stemMode = false;
 			stemPlaying = false;
 			return;
 		}
-		const target = Math.max(0, currentTime + videoOffsetSec);
-		if (Math.abs(el.currentTime - target) > 0.3) el.currentTime = target;
-		setStemLevel(el);
+		stemPlaying = !!players && isStem(effectiveSource);
+		if (!players) return;
+		const target = stemTarget();
+		const now = performance.now();
+		for (const [s, p] of players) {
+			if (
+				Math.abs(p.el.currentTime - target) > STEM_DRIFT &&
+				now - (stemLastFix.get(p.el) ?? 0) > STEM_FIX_GAP * 1000 &&
+				!p.el.seeking
+			) {
+				p.el.currentTime = target;
+				stemLastFix.set(p.el, now);
+			}
+			if (p.el.paused) void p.el.play().catch(() => {});
+			setStemLevel(s, p.el);
+		}
 	}
 
-	// Volume and channel (L / LR / R) for the stem's player.
-	function setStemLevel(el: HTMLAudioElement) {
+	// Where the stems should be: the reference player's position while it
+	// runs, else the tab's.
+	function stemTarget(): number {
+		return videoElement && videoUrl && !videoElement.paused && !videoElement.seeking
+			? videoElement.currentTime
+			: Math.max(0, currentTime + videoOffsetSec);
+	}
+
+	// Volume and channel (L / LR / R) for a stem's player: full for the
+	// selected stem, silent for the rest.
+	function setStemLevel(stem: StemSource, el: HTMLAudioElement) {
+		const level = stemMode && effectiveSource === stem && !refBackgroundMuted ? videoVolume : 0;
+		const applied = `${level}|${listenChannel}`;
+		if (stemApplied.get(el) === applied) return;
+		stemApplied.set(el, applied);
 		const router = listenChannel !== 'both' ? ChannelRouter.for(el) : ChannelRouter.existing(el);
 		if (router) {
 			router.setChannel(listenChannel);
-			router.setLevel(videoVolume);
+			router.setLevel(level);
 		} else {
-			el.volume = Math.max(0, Math.min(1, videoVolume));
+			el.volume = Math.max(0, Math.min(1, level));
 		}
 	}
 
@@ -2189,25 +2514,7 @@
 			0,
 			Math.min(STRING_COUNT - 1, Math.round((cy - cfg.paddingTop) / stringGap))
 		);
-		let time: number;
-		if (renderMode === 'page') {
-			const pageDur = tab.secondsPerBar * barsPerPage;
-			const secondsPerBeat = tab.secondsPerBar / tab.timeSignature[0];
-			const peekDur = peekBeats * secondsPerBeat;
-			const totalDur = pageDur + peekDur;
-			const usableWidth = cssW - cfg.paddingX * 2;
-			const pxPerSec = usableWidth / totalDur;
-			const pageIndex = Math.floor(currentTime / pageDur);
-			const pageStart = pageIndex * pageDur;
-			time = pageStart + (cx - cfg.paddingX) / pxPerSec;
-		} else {
-			const usableWidth = cssW - cfg.paddingX * 2;
-			const totalDur =
-				barsPerPage * tab.secondsPerBar + peekBeats * (tab.secondsPerBar / tab.timeSignature[0]);
-			const pxPerSec = totalDur > 0 ? usableWidth / totalDur : pixelsPerSecond;
-			const playheadX = cssW * cfg.playheadFraction;
-			time = currentTime + (cx - playheadX) / pxPerSec;
-		}
+		const time = tabTimeScale(cssW, cfg).xToTime(cx);
 		return { time, stringIndex };
 	}
 
@@ -2266,10 +2573,9 @@
 
 	function snapTime(t: number): number {
 		if (!tab) return t;
-		// gridStep is the "denominator" (16 = sixteenth). Interval in seconds
-		// = whole-note duration / gridStep = (240 / bpm) / gridStep.
-		const step = 240 / tab.bpm / gridStep;
-		return Math.max(0, Math.round(t / step) * step);
+		// gridStep is the "denominator" (16 = sixteenth): a whole note at the
+		// local tempo / gridStep. Grid lines restart at every bar line.
+		return snapToGrid(tab, t, gridStep);
 	}
 
 	// Starting fret when you hover / click an empty spot. With "reuse fret" on
@@ -2315,8 +2621,7 @@
 	// within a beat without the click snapping to the previous note.
 	function findAuthorNoteAt(pos: { time: number; stringIndex: number }): TabNote | null {
 		if (!tab) return null;
-		const step = 240 / tab.bpm / gridStep;
-		const timeTol = step / 2;
+		const timeTol = gridStepAt(tab, pos.time, gridStep) / 2;
 		let best: TabNote | null = null;
 		let bestDt = Infinity;
 		for (const n of tab.notes) {
@@ -2336,7 +2641,7 @@
 		if (!tab) return null;
 		const onString = findAuthorNoteAt(pos);
 		if (onString) return onString;
-		const timeTol = 240 / tab.bpm / gridStep / 2;
+		const timeTol = gridStepAt(tab, pos.time, gridStep) / 2;
 		let best: TabNote | null = null;
 		let bestDt = Infinity;
 		for (const n of tab.notes) {
@@ -2353,9 +2658,10 @@
 	// moment the pointer passes (or clears it — the first moment decides
 	// which); released, it's one undo step. A tap toggles just the one
 	// moment. The first moment is heard as soon as the key goes down.
-	const MOMENT_KEYS = { m: 'palmMute', r: 'letRing' } as const;
+	const MOMENT_KEYS = { m: 'palmMute', r: 'letRing', p: 'pickSlide' } as const;
+	const MOMENT_NAMES = { palmMute: 'palm mute', letRing: 'let ring', pickSlide: 'pick slide' };
 	let pmPaint = $state<{
-		kind: 'palmMute' | 'letRing';
+		kind: 'palmMute' | 'letRing' | 'pickSlide';
 		on: boolean;
 		times: number[];
 		code: string;
@@ -2396,7 +2702,7 @@
 		return changes;
 	}
 
-	function startPmPaint(key: 'm' | 'r', hit: TabNote, code: string) {
+	function startPmPaint(key: keyof typeof MOMENT_KEYS, hit: TabNote, code: string) {
 		const kind = MOMENT_KEYS[key];
 		pmPaint = {
 			kind,
@@ -2419,7 +2725,7 @@
 		const changes = pmPaintChanges();
 		pmPaint = null;
 		if (changes.length === 0 || !tab) return;
-		const name = p.kind === 'palmMute' ? 'palm mute' : 'let ring';
+		const name = MOMENT_NAMES[p.kind];
 		commitEdit(
 			batchCommand(
 				`${p.on ? 'Add' : 'Remove'} ${name}`,
@@ -2428,15 +2734,66 @@
 		);
 	}
 
-	function noteDefaultDuration(palmMute: boolean): number {
+	function noteDefaultDuration(palmMute: boolean, time: number): number {
 		if (!tab) return 0.5;
-		const oneBeat = tab.secondsPerBar / tab.timeSignature[0];
+		const oneBeat = barAt(tab, time).beatLength;
 		// PM notes get half a beat (an 1/8 note) so the dashed marker in
 		// notation doesn't extend across a whole beat's worth of empty tab,
 		// and the visual duration lines up with the plucked-and-damped
 		// sound. Normal notes get a whole beat as before.
 		if (palmMute) return oneBeat / 2;
 		return oneBeat;
+	}
+
+	// Dragging a note's fret (placing, editing, moving an arpeggio) locks the
+	// pointer: the cursor hides and stays where the drag started, so on
+	// release it's still next to the note. Movement is summed from
+	// movementX/Y (reported with or without the lock) into a virtual
+	// pointer that the drag uses instead of the real position.
+	// The lock is only asked for once the pointer actually moves, so a plain
+	// click never hides the cursor.
+	let dragPointer: { x: number; y: number; asked: boolean } | null = null;
+
+	function startDragLock(ev: PointerEvent) {
+		dragPointer = { x: ev.clientX, y: ev.clientY, asked: false };
+	}
+
+	function askDragLock() {
+		if (!dragPointer || dragPointer.asked) return;
+		dragPointer.asked = true;
+		try {
+			const locking = canvas.requestPointerLock?.() as Promise<void> | undefined;
+			locking?.catch?.(() => {
+				// Not allowed (or unsupported): the drag still works, the
+				// cursor just moves along as before.
+			});
+		} catch {
+			// ditto
+		}
+	}
+
+	// A lock that arrives after the drag already ended is let go at once.
+	onMount(() => {
+		const onChange = () => {
+			if (document.pointerLockElement === canvas && !dragPointer) document.exitPointerLock();
+		};
+		document.addEventListener('pointerlockchange', onChange);
+		return () => document.removeEventListener('pointerlockchange', onChange);
+	});
+
+	// Pointer capture fails while a lock is changing; the gesture works
+	// without it.
+	function capturePointer(ev: PointerEvent) {
+		try {
+			canvas.setPointerCapture(ev.pointerId);
+		} catch {
+			// ignore
+		}
+	}
+
+	function endDragLock() {
+		dragPointer = null;
+		if (document.pointerLockElement === canvas) document.exitPointerLock();
 	}
 
 	function onAuthorPointerDown(ev: PointerEvent) {
@@ -2454,7 +2811,7 @@
 				lastX: ev.clientX,
 				lastY: ev.clientY
 			};
-			canvas.setPointerCapture(ev.pointerId);
+			capturePointer(ev);
 			ev.preventDefault();
 			return;
 		}
@@ -2484,7 +2841,7 @@
 			} else {
 				authorGesture = { kind: 'move-free', noteId: hit.id, fret: hit.fret, ...base };
 			}
-			canvas.setPointerCapture(ev.pointerId);
+			capturePointer(ev);
 			ev.preventDefault();
 			previewPlacePitch();
 			return;
@@ -2513,7 +2870,8 @@
 				// A sweep just moves as a block (its shapes are all movable).
 				chord: currentTool === 6 ? null : identifyVoicing(voicing)
 			};
-			canvas.setPointerCapture(ev.pointerId);
+			capturePointer(ev);
+			startDragLock(ev);
 			ev.preventDefault();
 			previewPlacePitch();
 			return;
@@ -2530,9 +2888,11 @@
 				startX: ev.clientX,
 				startY: ev.clientY,
 				group,
-				chord: currentTool === 4 && group.length > 0 ? identifyChord(hit, group) : null
+				chord: currentTool === 4 && group.length > 0 ? identifyChord(hit, group) : null,
+				...shapeFields(hit, group)
 			};
-			canvas.setPointerCapture(ev.pointerId);
+			capturePointer(ev);
+			startDragLock(ev);
 			ev.preventDefault();
 			previewPlacePitch();
 			return;
@@ -2550,9 +2910,12 @@
 			currentFret: startingFret,
 			startX: ev.clientX,
 			startY: ev.clientY,
-			anchorFret: startingFret
+			anchorFret: startingFret,
+			shapeStart: currentShape?.id ?? null,
+			shapeNow: currentShape?.id ?? null
 		};
-		canvas.setPointerCapture(ev.pointerId);
+		capturePointer(ev);
+		startDragLock(ev);
 		ev.preventDefault();
 		// Audition the initial pitch immediately so the user hears the
 		// note that would be committed on release. Preview updates as
@@ -2641,7 +3004,7 @@
 			// Shape drag: audition the whole power chord at its new position.
 			const g = authorGesture;
 			const delta = g.currentFret - g.initialFret;
-			const key = `edit-shape:${g.noteId}:${delta}`;
+			const key = `edit-shape:${g.noteId}:${delta}:${g.shapeNow}`;
 			if (key === lastPreviewKey) return;
 			lastPreviewKey = key;
 			if (!audioOn) return;
@@ -2704,7 +3067,14 @@
 
 	function onAuthorPointerMove(ev: PointerEvent) {
 		if (!tab) return;
-		lastPointerClient = { x: ev.clientX, y: ev.clientY };
+		if (dragPointer) {
+			dragPointer.x += ev.movementX;
+			dragPointer.y += ev.movementY;
+			if (ev.movementX !== 0 || ev.movementY !== 0) askDragLock();
+		}
+		const px = dragPointer?.x ?? ev.clientX;
+		const py = dragPointer?.y ?? ev.clientY;
+		lastPointerClient = { x: px, y: py };
 		if (artHold) {
 			// Holding B/S/V: the mouse adjusts the articulation, and the hover
 			// target stays locked to the note the key was pressed on.
@@ -2748,8 +3118,8 @@
 			authorGesture = { ...g, ids: [...ids], lastX: ev.clientX, lastY: ev.clientY };
 			return;
 		}
-		const dx = ev.clientX - authorGesture.startX;
-		const dy = ev.clientY - authorGesture.startY;
+		const dx = px - authorGesture.startX;
+		const dy = py - authorGesture.startY;
 		if (
 			authorGesture.kind === 'move-fingering' ||
 			authorGesture.kind === 'move-free' ||
@@ -2769,8 +3139,24 @@
 			return;
 		}
 		const fretDelta = Math.round(dx / PX_PER_FRET);
+		// Power-chord tools: vertical drag steps through the shapes (up = next,
+		// like Ctrl+→) — a power chord is rarely moved by an octave.
+		const shapeStart =
+			authorGesture.kind === 'place' || authorGesture.kind === 'edit'
+				? authorGesture.shapeStart
+				: null;
+		if (shapeStart !== null && (authorGesture.kind === 'place' || authorGesture.kind === 'edit')) {
+			const shapeNow = shapeStepped(shapeStart, Math.round(-dy / PX_PER_SHAPE));
+			if (shapeNow !== authorGesture.shapeNow) {
+				authorGesture = { ...authorGesture, shapeNow };
+				// A new chord uses (and keeps) the tool's shape.
+				if (authorGesture.kind === 'place' && (currentTool === 2 || currentTool === 3)) {
+					toolShapes = { ...toolShapes, [currentTool]: shapeNow };
+				}
+			}
+		}
 		// Up is a decreasing dy, and up should INCREASE octave → invert.
-		const octaveDelta = Math.round(-dy / PX_PER_OCTAVE);
+		const octaveDelta = shapeStart !== null ? 0 : Math.round(-dy / PX_PER_OCTAVE);
 		const raw = authorGesture.initialFret + fretDelta + octaveDelta * 12;
 		let currentFret = Math.max(0, Math.min(MAX_FRET, raw));
 		if (authorGesture.kind === 'edit' && authorGesture.group.length > 0 && !authorGesture.chord) {
@@ -2798,6 +3184,7 @@
 	}
 
 	function onAuthorPointerUp(ev: PointerEvent) {
+		endDragLock();
 		if (!tab || !authorGesture) return;
 		try {
 			canvas.releasePointerCapture(ev.pointerId);
@@ -2848,6 +3235,10 @@
 			if (isSequenceTool()) {
 				const ids = new Set(notes.map((n) => n.id));
 				auditionNotes(tab.notes.filter((n) => ids.has(n.id)));
+			} else {
+				// The numpad continues from what was just placed.
+				const root = notes.find((n) => n.stringIndex === g.stringIndex) ?? notes[0];
+				if (root) setMouseEntry(root.id);
 			}
 			return;
 		}
@@ -2879,8 +3270,11 @@
 			return;
 		}
 		if (g.kind === 'edit') {
+			// Clicked or dragged: the numpad continues from it (after the
+			// edit below is committed).
+			queueMicrotask(() => setMouseEntry(g.noteId));
 			// Zero-drag click on an existing note.
-			if (g.currentFret === g.initialFret) {
+			if (g.currentFret === g.initialFret && g.shapeNow === g.shapeStart) {
 				// In palm-mute variant, click toggles palm mute on every note
 				// at that time (same as the M key).
 				if (toolVariant === 'palmMute') {
@@ -2895,6 +3289,15 @@
 				// Re-voiced chord: move the root, swap the rest for the new voicing.
 				const root = tab.notes.find((n) => n.id === g.noteId);
 				if (!root) return;
+				// A power chord dragged to another shape: that's the tool's
+				// shape from now on (as with Ctrl+←/→).
+				if (
+					g.shapeNow !== null &&
+					g.shapeNow !== g.shapeStart &&
+					(currentTool === 2 || currentTool === 3)
+				) {
+					toolShapes = { ...toolShapes, [currentTool]: g.shapeNow };
+				}
 				commitEdit(
 					batchCommand('Move chord', [
 						cmdUpdateNote(g.noteId, {
@@ -3124,6 +3527,84 @@
 
 	// What a new placement at `time` gets: the tool variant, unless it joins
 	// an existing stack, whose state wins.
+	// Note tool: the pitch of the note being dragged, or of the hovered spot
+	// (the fret a click there would place / the note under the pointer).
+	function notePitchLabel(): string {
+		const tuning = TUNINGS[tuningKey];
+		const g = authorGesture;
+		let midi: number | null = null;
+		if (g && (g.kind === 'place' || g.kind === 'edit')) {
+			midi = tuning.openNotes[g.stringIndex] + g.currentFret;
+		} else if (hoverPos) {
+			midi = tuning.openNotes[hoverPos.stringIndex] + hoverFret;
+		}
+		return midi === null ? '' : pitchName(midi, tuningUsesFlats(tuning));
+	}
+
+	// Alt+click on the spectrogram: a note at that pitch straight below it in
+	// the tab (the clicked time, on the grid). It goes on the string nearest
+	// the hand position — the fret of the closest note in time — preferring a
+	// string that's free at that time; else the lowest fret. Nothing happens
+	// if that pitch is already there at that moment.
+	function addNoteFromSpectrogram(refTime: number, midi: number) {
+		if (!tab || mode !== 'author') return;
+		const tuning = TUNINGS[tuningKey];
+		const time = snapTime(Math.max(0, refTime - videoOffsetSec));
+		// That pitch is already there at that moment: nothing to add.
+		if (stackAt(time).some((n) => n.midi === midi)) return;
+		let hand: number | null = null;
+		let nearest = Infinity;
+		for (const n of tab.notes) {
+			const d = Math.abs(n.time - time);
+			if (d < nearest) {
+				nearest = d;
+				hand = n.fret;
+			}
+		}
+		const taken = new Set(stackAt(time).map((n) => n.stringIndex));
+		let pick: { stringIndex: number; fret: number } | null = null;
+		let bestScore = Infinity;
+		tuning.openNotes.forEach((open, stringIndex) => {
+			const fret = midi - open;
+			if (fret < 0 || fret > MAX_FRET) return;
+			const score =
+				(hand === null ? fret : Math.abs(fret - hand)) +
+				(taken.has(stringIndex) ? 100 : 0) +
+				fret * 0.01;
+			if (score < bestScore) {
+				bestScore = score;
+				pick = { stringIndex, fret };
+			}
+		});
+		if (!pick) return;
+		const { stringIndex, fret } = pick;
+		const displaced = notesDisplacedBy(time, [stringIndex]);
+		const arts = placementArts(time, new Set(displaced.map((n) => n.id)));
+		const note: TabNote = {
+			id: newNoteId(),
+			time,
+			duration: noteDefaultDuration(
+				arts.some((a) => a.kind === 'palmMute'),
+				time
+			),
+			stringIndex,
+			fret,
+			midi,
+			velocity: 0.85,
+			channel: 0,
+			articulations: [...arts]
+		};
+		const extend = extendDurationTo(tab, time + note.duration);
+		commitEdit(
+			batchCommand('Place note', [
+				...(extend ? [extend] : []),
+				...displaced.map((n) => cmdRemoveNote(n.id)),
+				cmdAddNote(note)
+			])
+		);
+		auditionNotes([note]);
+	}
+
 	function placementArts(time: number, exclude?: Set<string>): Articulation[] {
 		const base: Articulation[] = toolVariant === 'palmMute' ? [{ kind: 'palmMute' }] : [];
 		return adoptStackState(base, time, exclude);
@@ -3157,7 +3638,13 @@
 			notes.map((n) => ({
 				...$state.snapshot(n),
 				time: n.time - t0,
-				duration: Math.min(previewDuration(n.articulations), untilNext(n.time, times))
+				// A pick slide scrapes on to the end of its bar, as in playback.
+				duration: n.articulations.some((a) => a.kind === 'pickSlide')
+					? (() => {
+							const bar = barAt(tab!, n.time + 1e-6);
+							return bar.start + bar.length - n.time;
+						})()
+					: Math.min(previewDuration(n.articulations), untilNext(n.time, times))
 			}))
 		);
 	}
@@ -3238,8 +3725,7 @@
 
 	function defaultVibratoEnd(note: TabNote): number {
 		if (!tab) return note.time;
-		const beat = tab.secondsPerBar / tab.timeSignature[0];
-		let end = note.time + beat;
+		let end = note.time + barAt(tab, note.time).beatLength;
 		for (const n of tab.notes) {
 			if (n.stringIndex === note.stringIndex && n.time > note.time + 1e-6) {
 				end = Math.min(end, n.time);
@@ -3361,7 +3847,7 @@
 		} else {
 			const rest = withoutArts(b, 'vibrato');
 			const had = rest.length !== b.length;
-			const step = 240 / tab.bpm / gridStep;
+			const step = gridStepAt(tab, note.time, gridStep);
 			if (!h.moved) {
 				next = had
 					? rest
@@ -3426,40 +3912,21 @@
 	// renderer), shared by the author overlay and the spectrogram so both line
 	// up with the notes. pageStart..pageEnd is the page (or, in scroll mode,
 	// the span treated as the page); the peek follows it.
-	function tabTimeScale(
-		cssW: number,
-		cfg: typeof DEFAULT_RENDER_CONFIG
-	): {
-		timeToX: (t: number) => number;
-		pxPerSec: number;
-		pageStart: number;
-		pageEnd: number;
-	} {
-		const secondsPerBar = tab?.secondsPerBar ?? 2;
-		const secondsPerBeat = secondsPerBar / (tab?.timeSignature[0] ?? 4);
-		const peekDur = peekBeats * secondsPerBeat;
-		const usableWidth = cssW - cfg.paddingX * 2;
-		if (renderMode === 'page') {
-			const pageDur = secondsPerBar * barsPerPage;
-			const pxPerSec = usableWidth / (pageDur + peekDur);
-			const pageStart = Math.floor(currentTime / pageDur) * pageDur;
-			return {
-				timeToX: (t) => cfg.paddingX + (t - pageStart) * pxPerSec,
-				pxPerSec,
-				pageStart,
-				pageEnd: pageStart + pageDur
-			};
-		}
-		const totalDur = barsPerPage * secondsPerBar + peekDur;
-		const pxPerSec = totalDur > 0 ? usableWidth / totalDur : pixelsPerSecond;
-		const playheadX = cssW * cfg.playheadFraction;
-		const pageStart = currentTime - playheadX / pxPerSec;
-		return {
-			timeToX: (t) => playheadX + (t - currentTime) * pxPerSec,
-			pxPerSec,
-			pageStart,
-			pageEnd: pageStart + totalDur
-		};
+	function tabTimeScale(cssW: number, cfg: typeof DEFAULT_RENDER_CONFIG): TabLayout {
+		const fallback = { bpm: 120, timeSignature: [4, 4] as [number, number], secondsPerBar: 2 };
+		return tabLayout(
+			(tab ?? { ...fallback, notes: [], durationSec: 0, trimmedLeadingSec: 0 }) as Tab,
+			currentTime,
+			{
+				width: cssW,
+				paddingX: cfg.paddingX,
+				playheadFraction: cfg.playheadFraction,
+				barsPerPage,
+				peekBeats,
+				mode: renderMode,
+				pixelsPerSecond
+			}
+		);
 	}
 
 	function drawAuthorOverlay(
@@ -3471,9 +3938,7 @@
 		if (!tab) return;
 		const usableHeight = cssH - cfg.paddingTop - cfg.paddingBottom;
 		const stringGap = usableHeight / (STRING_COUNT - 1);
-		const secondsPerBeat = tab.secondsPerBar / tab.timeSignature[0];
-		const peekDur = peekBeats * secondsPerBeat;
-		const { timeToX, pageStart, pageEnd } = tabTimeScale(cssW, cfg);
+		const { timeToX, pageStart, pageEnd, peekDur } = tabTimeScale(cssW, cfg);
 
 		// Play-focus highlight. Whole-bar focus = subtle white overlay across
 		// the bar; single-beat focus = blue overlay on just that beat. No
@@ -3489,26 +3954,32 @@
 			ctx.fillRect(fx0, cfg.paddingTop - 8, Math.max(1, fx1 - fx0), usableHeight + 16);
 		}
 
+		drawActiveEntry(ctx, timeToX, cfg, stringGap);
+
 		// Grid subdivision lines — visible enough that the user can see
 		// every snap position. Beats (renderer draws those) are darker;
 		// subdivisions in between are lighter but still legible.
-		const step = 240 / tab.bpm / gridStep;
-		const secondsPerBeatLocal = tab.secondsPerBar / tab.timeSignature[0];
 		ctx.lineWidth = 1;
-		const gStart = Math.ceil(pageStart / step) * step;
-		for (let t = gStart; t <= pageEnd + peekDur + 1e-6; t += step) {
-			const x = timeToX(t);
-			if (x < cfg.paddingX - 1 || x > cssW - cfg.paddingX + 1) continue;
-			// Is this a beat boundary? (Renderer already draws those, but our
-			// step might not include them if it's a triplet grid; render our
-			// own for consistency, brighter.) Detect by modulo of the beat.
-			const rel = t / secondsPerBeatLocal;
-			const isBeat = Math.abs(rel - Math.round(rel)) < 1e-4;
-			ctx.strokeStyle = isBeat ? 'rgba(255, 255, 255, 0.20)' : 'rgba(255, 255, 255, 0.11)';
-			ctx.beginPath();
-			ctx.moveTo(x, cfg.paddingTop);
-			ctx.lineTo(x, cssH - cfg.paddingBottom);
-			ctx.stroke();
+		const gridEnd = pageEnd + peekDur + 1e-6;
+		for (let b = barAt(tab, Math.max(0, pageStart)).index; ; b++) {
+			const bar = barInfo(tab, b);
+			if (bar.start > gridEnd) break;
+			// Grid lines restart at every bar line (bars may differ in tempo).
+			const step = 240 / bar.bpm / gridStep;
+			for (let t = bar.start; t < bar.start + bar.length - 1e-6 && t <= gridEnd; t += step) {
+				const x = timeToX(t);
+				if (x < cfg.paddingX - 1 || x > cssW - cfg.paddingX + 1) continue;
+				// Is this a beat boundary? (Renderer already draws those, but our
+				// step might not include them if it's a triplet grid; render our
+				// own for consistency, brighter.)
+				const rel = (t - bar.start) / bar.beatLength;
+				const isBeat = Math.abs(rel - Math.round(rel)) < 1e-4;
+				ctx.strokeStyle = isBeat ? 'rgba(255, 255, 255, 0.20)' : 'rgba(255, 255, 255, 0.11)';
+				ctx.beginPath();
+				ctx.moveTo(x, cfg.paddingTop);
+				ctx.lineTo(x, cssH - cfg.paddingBottom);
+				ctx.stroke();
+			}
 		}
 
 		// Tool name and what it will place (shape / chord / sweep info),
@@ -3524,7 +3995,9 @@
 				? chordToolLabel()
 				: currentTool === 6
 					? sweepToolLabel()
-					: '';
+					: currentTool === 1
+						? notePitchLabel()
+						: '';
 		const toolLabel = [TOOL_NAMES[currentTool], toolInfo].filter(Boolean).join(' · ');
 		ctx.save();
 		ctx.font = '600 12px "JetBrains Mono Variable", ui-monospace, monospace';
@@ -3701,7 +4174,7 @@
 				if (n) refret(n, t.stringIndex, t.fret);
 			}
 		} else if (g.kind === 'edit') {
-			if (g.currentFret === g.initialFret) return null;
+			if (g.currentFret === g.initialFret && g.shapeNow === g.shapeStart) return null;
 			const root = byId(g.noteId);
 			if (!root) return null;
 			refret(root, g.stringIndex, g.currentFret);
@@ -3754,6 +4227,296 @@
 		// Same h/p fix-up a commit would run, applied to the copies.
 		cmdReconcileHammerPull().apply(preview);
 		return preview;
+	}
+
+	// ---- Numpad entry ------------------------------------------------------------
+	// The "active" note or chord (the reference) is the last one clicked /
+	// dragged / placed (single notes, power chords, chords). Numpad 1–9 enter
+	// the same kind at the entry cursor (the dashed box: a grid step after the
+	// reference or the previous entry), fret −4 … +4 from the reference (5 =
+	// same fret), with its articulations. The reference stays until 0 makes
+	// the last numpad-entered note the reference, or "." (eyedropper) makes
+	// the hovered note the reference, leaving the box where it is. Numpad + / Enter put the following entries a string
+	// up / down (same fret reference); / and * move the cursor a grid step
+	// left / right. With no reference, the first numpad key starts one in the
+	// focused bar, after its last note.
+	// Stored as note ids, root (lowest string) first.
+	let activeEntry = $state<string[] | null>(null);
+	// A reference that isn't a note in the tab (started in an empty spot).
+	let virtualEntry = $state<TabNote | null>(null);
+	// Where the next entry goes (seconds).
+	let entryNext = $state<number | null>(null);
+	let lastNumpadEntry: string[] | null = null;
+	// Strings to move the next entry by (−1 = one string higher).
+	let entryStringShift = $state(0);
+	const NUMPAD_DELTA: Record<string, number> = {
+		Numpad1: -4,
+		Numpad2: -3,
+		Numpad3: -2,
+		Numpad4: -1,
+		Numpad5: 0,
+		Numpad6: 1,
+		Numpad7: 2,
+		Numpad8: 3,
+		Numpad9: 4
+	};
+	// The numpad key whose note is being heard (stopped on its release).
+	let numpadPreviewKey: string | null = null;
+
+	// The reference's notes as they are now (root first), or null.
+	function activeNotes(): TabNote[] | null {
+		if (!tab) return null;
+		if (!activeEntry) return virtualEntry ? [virtualEntry] : null;
+		const notes = activeEntry
+			.map((id) => tab!.notes.find((n) => n.id === id))
+			.filter((n): n is TabNote => !!n);
+		return notes.length > 0 && notes[0].id === activeEntry[0] ? notes : null;
+	}
+
+	// Make `ids` the reference, with the cursor right after it.
+	function setEntryReference(ids: string[]) {
+		const root = tab?.notes.find((n) => n.id === ids[0]);
+		if (!root) return;
+		activeEntry = ids;
+		virtualEntry = null;
+		entryNext = stepGrid(tab!, root.time, gridStep, 1);
+		entryStringShift = 0;
+	}
+
+	// A note (and the rest of its power chord / chord, in those tools)
+	// clicked, dragged or placed with the mouse becomes the reference.
+	function setMouseEntry(rootId: string) {
+		const root = tab?.notes.find((n) => n.id === rootId);
+		if (!root) return;
+		const members = currentTool >= 2 && currentTool <= 4 ? powerChordGroupFor(root) : [];
+		setEntryReference([root.id, ...members.map((m) => m.id)]);
+	}
+
+	// Numpad "." over a note: it becomes the fret reference, but the box stays
+	// where it is (same time, same string); with no box yet, it starts right
+	// after the note.
+	function eyedropEntry(hit: TabNote) {
+		const members = currentTool >= 2 && currentTool <= 4 ? powerChordGroupFor(hit) : [];
+		const ids = [hit.id, ...members.map((m) => m.id)];
+		const old = activeNotes();
+		if (entryNext === null || !old) {
+			setEntryReference(ids);
+			return;
+		}
+		const boxString = old[0].stringIndex + entryStringShift;
+		activeEntry = ids;
+		virtualEntry = null;
+		const shift = boxString - hit.stringIndex;
+		const strings = [hit.stringIndex, ...members.map((m) => m.stringIndex)];
+		entryStringShift = strings.every((st) => st + shift >= 0 && st + shift < STRING_COUNT)
+			? shift
+			: 0;
+	}
+
+	// No reference yet: start one in the focused bar, right after its last
+	// note (or at its start), on the hovered string (else the lowest), at the
+	// fret a click there would place.
+	function startVirtualEntry(): boolean {
+		if (!tab) return false;
+		const bar = barInfo(tab, authorFocus.barIdx);
+		const barStart = bar.start;
+		const barEnd = bar.start + bar.length;
+		const inBar = tab.notes.filter((n) => n.time >= barStart - 1e-6 && n.time < barEnd - 1e-6);
+		const time = inBar.length
+			? stepGrid(tab, Math.max(...inBar.map((n) => n.time)), gridStep, 1)
+			: barStart;
+		const stringIndex = hoverPos?.stringIndex ?? STRING_COUNT - 1;
+		const fret = defaultFretForString(stringIndex, time);
+		const arts = placementArts(time);
+		virtualEntry = {
+			id: 'numpad-reference',
+			time,
+			duration: noteDefaultDuration(
+				arts.some((a) => a.kind === 'palmMute'),
+				time
+			),
+			stringIndex,
+			fret,
+			midi: TUNINGS[tuningKey].openNotes[stringIndex] + fret,
+			velocity: 0.85,
+			channel: 0,
+			articulations: arts
+		};
+		activeEntry = null;
+		entryNext = time;
+		entryStringShift = 0;
+		return true;
+	}
+
+	function numpadEnter(delta: number) {
+		const notes = activeNotes();
+		if (!tab || !notes || entryNext === null) return;
+		const tuning = TUNINGS[tuningKey];
+		const root = notes[0];
+		const time = entryNext;
+		const shift = entryStringShift;
+		// The root keeps the fret reference (on its new string, if moved);
+		// the others keep their pitch distance from it.
+		const rootString = root.stringIndex + shift;
+		const rootFret = root.fret + delta;
+		if (rootString < 0 || rootString >= STRING_COUNT || rootFret < 0 || rootFret > MAX_FRET) return;
+		const rootMidi = tuning.openNotes[rootString] + rootFret;
+		const placed: TabNote[] = [];
+		for (const n of notes) {
+			const stringIndex = n.stringIndex + shift;
+			if (stringIndex < 0 || stringIndex >= STRING_COUNT) return;
+			const midi = rootMidi + (n.midi - root.midi);
+			const fret = midi - tuning.openNotes[stringIndex];
+			if (fret < 0 || fret > MAX_FRET) return;
+			placed.push({
+				...$state.snapshot(n),
+				id: newNoteId(),
+				time,
+				stringIndex,
+				fret,
+				midi,
+				articulations: shiftTimedArticulations($state.snapshot(n.articulations), time - n.time)
+			});
+		}
+		const displaced = notesDisplacedBy(
+			time,
+			placed.map((n) => n.stringIndex)
+		);
+		const extend = extendDurationTo(tab, Math.max(...placed.map((n) => n.time + n.duration)));
+		// The box moves on with the entry, and back with its undo.
+		const before = { next: entryNext, last: lastNumpadEntry };
+		const after = { next: stepGrid(tab, time, gridStep, 1), last: placed.map((n) => n.id) };
+		const moveBox = {
+			label: 'Move entry box',
+			apply() {
+				entryNext = after.next;
+				lastNumpadEntry = after.last;
+			},
+			revert() {
+				entryNext = before.next;
+				lastNumpadEntry = before.last;
+			}
+		};
+		commitEdit(
+			batchCommand(placed.length > 1 ? 'Enter chord' : 'Enter note', [
+				...(extend ? [extend] : []),
+				...displaced.map((n) => cmdRemoveNote(n.id)),
+				...placed.map((n) => cmdAddNote(n)),
+				moveBox
+			])
+		);
+		auditionNotes(placed);
+		followEntryCursor(time);
+	}
+
+	// Focus the bar holding `time` (the box when it's moved; the note just
+	// entered — so a finished bar stays in view until the next one gets a
+	// note).
+	function followEntryCursor(time = entryNext) {
+		if (!tab || time === null || playing) return;
+		const barIdx = barAt(tab, time).index;
+		if (barIdx !== authorFocus.barIdx && barIdx >= 0) {
+			authorFocus = { barIdx, beatIdx: 0 };
+			syncPlayheadToFocus();
+		}
+	}
+
+	// Numpad + / Enter: the next entry a string higher / lower.
+	function shiftEntryString(dir: -1 | 1) {
+		const notes = activeNotes();
+		if (!notes) return;
+		const next = entryStringShift + dir;
+		const fits = notes.every(
+			(n) => n.stringIndex + next >= 0 && n.stringIndex + next < STRING_COUNT
+		);
+		if (fits) entryStringShift = next;
+	}
+
+	// Numpad / and *: the cursor a grid step left / right.
+	function moveEntryCursor(dir: -1 | 1) {
+		if (entryNext === null) return;
+		if (!tab) return;
+		entryNext = stepGrid(tab, entryNext, gridStep, dir);
+		followEntryCursor();
+	}
+
+	// Returns true when the key was a numpad entry key.
+	function numpadKey(e: KeyboardEvent): boolean {
+		const delta = NUMPAD_DELTA[e.code];
+		// The numpad's decimal key reports differently per layout / keyboard
+		// ("." or "," — NumpadDecimal, NumpadComma, or just its location).
+		// The regular "." key works too, except in the chord / arp / sweep
+		// tools, where it steps to the previous variation.
+		const decimal =
+			e.code === 'NumpadDecimal' ||
+			e.code === 'NumpadComma' ||
+			(e.location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD &&
+				['.', ',', 'Decimal', 'Separator', 'Delete'].includes(e.key)) ||
+			(e.key === '.' && !e.ctrlKey && !isChordTool() && currentTool !== 6);
+		if (delta === undefined && !decimal && !/^Numpad(0|Add|Enter|Divide|Multiply)$/.test(e.code)) {
+			return false;
+		}
+		e.preventDefault();
+		const moving = e.code === 'NumpadDivide' || e.code === 'NumpadMultiply';
+		// Moving the cursor may repeat while held; entering notes doesn't.
+		if (e.repeat && !moving) return true;
+		// Nothing to continue from: start in the focused bar.
+		if (
+			!activeNotes() &&
+			(delta !== undefined || moving || e.code === 'NumpadAdd' || e.code === 'NumpadEnter')
+		) {
+			if (!startVirtualEntry()) return true;
+			if (moving) return true;
+		}
+		if (delta !== undefined) {
+			numpadEnter(delta);
+			numpadPreviewKey = e.code;
+		} else if (e.code === 'Numpad0') {
+			// The last entered note becomes the reference; carry on after it.
+			if (lastNumpadEntry) setEntryReference(lastNumpadEntry);
+		} else if (decimal) {
+			const hit = hoverPos ? findAuthorNoteAt(hoverPos) : null;
+			if (hit) eyedropEntry(hit);
+		} else if (e.code === 'NumpadAdd') shiftEntryString(-1);
+		else if (e.code === 'NumpadEnter') shiftEntryString(1);
+		else if (e.code === 'NumpadDivide') moveEntryCursor(-1);
+		else if (e.code === 'NumpadMultiply') moveEntryCursor(1);
+		return true;
+	}
+
+	// Outline the reference, and mark where the next entry goes.
+	function drawActiveEntry(
+		ctx: CanvasRenderingContext2D,
+		timeToX: (t: number) => number,
+		cfg: typeof DEFAULT_RENDER_CONFIG,
+		stringGap: number
+	) {
+		const notes = activeNotes();
+		if (!tab || !notes) return;
+		ctx.save();
+		ctx.font = '400 18px "JetBrains Mono Variable", ui-monospace, Menlo, Consolas, monospace';
+		ctx.strokeStyle = '#ffcc55';
+		ctx.lineWidth = 1.5;
+		if (!virtualEntry) {
+			for (const n of notes) {
+				const w = ctx.measureText(String(n.fret)).width;
+				const x = timeToX(n.time);
+				const y = cfg.paddingTop + n.stringIndex * stringGap;
+				ctx.beginPath();
+				ctx.roundRect(x - w / 2 - 5, y - 12, w + 10, 24, 4);
+				ctx.stroke();
+			}
+		}
+		if (entryNext !== null) {
+			const root = notes[0];
+			const x = timeToX(entryNext);
+			const y = cfg.paddingTop + (root.stringIndex + entryStringShift) * stringGap;
+			ctx.setLineDash([3, 3]);
+			ctx.beginPath();
+			ctx.roundRect(x - 9, y - 12, 18, 24, 4);
+			ctx.stroke();
+		}
+		ctx.restore();
 	}
 
 	function drawHoverOutline(
@@ -3821,6 +4584,32 @@
 			.map((n) => ({ id: n.id, stringIndex: n.stringIndex, initialFret: n.fret }));
 	}
 
+	// Power-chord tools: the shape of the chord whose root is being dragged
+	// (so a vertical drag can step from it), or nulls for a single note.
+	function shapeFields(
+		root: TabNote,
+		group: ShapeGroupMember[]
+	): { shapeStart: string | null; shapeNow: string | null } {
+		if ((currentTool !== 2 && currentTool !== 3) || group.length === 0) {
+			return { shapeStart: null, shapeNow: null };
+		}
+		const members = group.map((m) => ({ stringIndex: m.stringIndex, fret: m.initialFret }));
+		const id =
+			matchShape(shapesForTool(currentTool), TUNINGS[tuningKey], root, members)?.id ?? null;
+		return { shapeStart: id, shapeNow: id };
+	}
+
+	// The shape `steps` along the power-chord tool's list from `fromId`
+	// (stopping at either end — a long drag doesn't wrap around).
+	function shapeStepped(fromId: string, steps: number): string {
+		const shapes = shapesForTool(currentTool === 3 ? 3 : 2);
+		const i = Math.max(
+			0,
+			shapes.findIndex((sh) => sh.id === fromId)
+		);
+		return shapes[Math.max(0, Math.min(shapes.length - 1, i + steps))].id;
+	}
+
 	// Lowest note sounding at its time (nothing on a lower string).
 	function isStackRoot(note: TabNote): boolean {
 		return !stackAt(note.time).some((n) => n.stringIndex > note.stringIndex);
@@ -3836,6 +4625,16 @@
 		replace: boolean;
 		members: Array<{ id?: string; stringIndex: number; fret: number }>;
 	} {
+		// Power chord dragged to another shape: rebuilt as that shape.
+		if (g.shapeNow !== null && g.shapeNow !== g.shapeStart) {
+			const shape = shapesForTool(currentTool === 3 ? 3 : 2).find((sh) => sh.id === g.shapeNow);
+			if (shape) {
+				return {
+					replace: true,
+					members: shapeSpots(shape, TUNINGS[tuningKey], g.stringIndex, g.currentFret).slice(1)
+				};
+			}
+		}
 		const delta = g.currentFret - g.initialFret;
 		const shifted = g.group.map((m) => ({
 			id: m.id,
@@ -4044,7 +4843,7 @@
 		}
 		const i = slots.findIndex((s) => s.notes.includes(hit));
 		if (i < 0 || slots[i].notes.length !== 1) return null;
-		const beat = tab.secondsPerBar / tab.timeSignature[0];
+		const beat = barAt(tab, hit.time).beatLength;
 		const single = (s?: { notes: TabNote[] }) => !!s && s.notes.length === 1;
 		const gapNext = single(slots[i + 1]) ? slots[i + 1].time - slots[i].time : Infinity;
 		const gapPrev = single(slots[i - 1]) ? slots[i].time - slots[i - 1].time : Infinity;
@@ -4617,7 +5416,7 @@
 		opts: { pattern?: SweepPattern; loops?: number; step?: number } = {}
 	): Array<{ time: number; stringIndex: number; fret: number; art?: Articulation['kind'] }> {
 		if (!tab) return [];
-		const step = opts.step ?? 240 / tab.bpm / gridStep;
+		const step = opts.step ?? gridStepAt(tab, start, gridStep);
 		return sweepSequence(shape, opts.pattern ?? sweepPattern(), opts.loops ?? sweepLoops).map(
 			(n, i) => ({
 				time: start + i * step,
@@ -4664,7 +5463,7 @@
 		const { pass, cycle } = arpCycle(tones.length, opts.pattern ?? arpPattern);
 		const length = opts.length ?? arpLength;
 		const order = length > 0 ? Array.from({ length }, (_, i) => cycle[i % cycle.length]) : pass;
-		const step = opts.step ?? 240 / tab.bpm / gridStep;
+		const step = opts.step ?? gridStepAt(tab, start, gridStep);
 		return order.map((idx, i) => ({ time: start + i * step, ...tones[idx] }));
 	}
 
@@ -5001,7 +5800,7 @@
 				: n === 2
 					? [0.9, 0.8]
 					: [0.85];
-		const step = 240 / (tab?.bpm ?? 120) / gridStep;
+		const step = tab ? gridStepAt(tab, g.time, gridStep) : 0.125;
 		const notes = placed.map((p, i) => {
 			const arts = placementArts(p.time, gone);
 			const pm = arts.some((a) => a.kind === 'palmMute');
@@ -5009,7 +5808,7 @@
 				id: newNoteId(),
 				time: p.time,
 				// An arpeggio note lasts one grid step, up to the next note.
-				duration: isSequenceTool() ? step : noteDefaultDuration(pm),
+				duration: isSequenceTool() ? step : noteDefaultDuration(pm, p.time),
 				stringIndex: p.stringIndex,
 				fret: p.fret,
 				midi: tuning.openNotes[p.stringIndex] + p.fret,
@@ -5087,7 +5886,7 @@
 		const hit = findNearestNote(pos);
 		if (!hit) return;
 		dragging = { note: hit };
-		canvas.setPointerCapture(ev.pointerId);
+		capturePointer(ev);
 	}
 
 	function onCanvasPointerMove(ev: PointerEvent) {
@@ -5117,9 +5916,7 @@
 		if (!pos || !tab) return;
 		if (pos.stringIndex === note.stringIndex) {
 			// Click without a real drag — log info to help with debugging.
-			const secondsPerBeat = tab.secondsPerBar / tab.timeSignature[0];
-			const bar = Math.floor(note.time / tab.secondsPerBar) + 1;
-			const beat = Math.floor((note.time % tab.secondsPerBar) / secondsPerBeat) + 1;
+			const { bar, beat } = barBeat(tab, note.time);
 			console.log(`bar ${bar} beat ${beat}`, {
 				time: note.time.toFixed(3),
 				midi: note.midi,
@@ -5162,9 +5959,9 @@
 		const frac = Math.max(0, Math.min(1, x / rect.width));
 		let t = frac * effectiveDurationSec;
 		if (snap) {
-			const secondsPerBeat = tab.secondsPerBar / tab.timeSignature[0];
-			const beat = Math.round(t / secondsPerBeat);
-			t = beat * secondsPerBeat;
+			// Nearest beat (of the bar it's in).
+			const bar = barAt(tab, t);
+			t = bar.start + Math.round((t - bar.start) / bar.beatLength) * bar.beatLength;
 			t = Math.max(0, Math.min(effectiveDurationSec, t));
 		}
 		return t;
@@ -5175,8 +5972,8 @@
 	function seekFromTimeline(t: number) {
 		seekAbs(t);
 		if (mode !== 'author' || !tab) return;
-		const lastBar = Math.max(0, Math.ceil(effectiveDurationSec / tab.secondsPerBar) - 1);
-		const barIdx = Math.min(lastBar, Math.floor(currentTime / tab.secondsPerBar + 1e-6));
+		const lastBar = barCount(tab, effectiveDurationSec) - 1;
+		const barIdx = Math.min(lastBar, barAt(tab, currentTime).index);
 		if (authorFocus.barIdx !== barIdx || authorFocus.beatIdx !== 0) {
 			authorFocus = { barIdx, beatIdx: 0 };
 		}
@@ -5226,7 +6023,7 @@
 		if (!tab || effectiveDurationSec <= 0) return;
 		const tabRef = tab;
 		const durForDraw = effectiveDurationSec;
-		const totalBars = Math.max(1, Math.ceil(durForDraw / tabRef.secondsPerBar));
+		const totalBars = barCount(tabRef, durForDraw);
 		const xForTime = (t: number) => (t / durForDraw) * w;
 
 		// Filled progress up to currentTime
@@ -5234,17 +6031,17 @@
 		tctx.fillRect(0, 0, xForTime(currentTime), h);
 
 		// Beat lines (thin, subtle)
-		const beatsPerBar = tabRef.timeSignature[0];
-		const secondsPerBeat = tabRef.secondsPerBar / beatsPerBar;
 		tctx.strokeStyle = '#232c36';
 		tctx.lineWidth = 1;
-		const totalBeats = Math.ceil(durForDraw / secondsPerBeat);
-		for (let b = 0; b <= totalBeats; b++) {
-			const x = Math.round(xForTime(b * secondsPerBeat)) + 0.5;
-			tctx.beginPath();
-			tctx.moveTo(x, h * 0.55);
-			tctx.lineTo(x, h);
-			tctx.stroke();
+		for (let b = 0; b < totalBars; b++) {
+			const bar = barInfo(tabRef, b);
+			for (let i = 1; i < bar.beats; i++) {
+				const x = Math.round(xForTime(bar.start + i * bar.beatLength)) + 0.5;
+				tctx.beginPath();
+				tctx.moveTo(x, h * 0.55);
+				tctx.lineTo(x, h);
+				tctx.stroke();
+			}
 		}
 
 		// Bar lines (bolder) + bar numbers
@@ -5259,7 +6056,7 @@
 		const barPx = w / totalBars;
 		const labelEvery = Math.max(1, Math.ceil(minLabelPx / barPx));
 		for (let b = 0; b <= totalBars; b++) {
-			const x = Math.round(xForTime(b * tabRef.secondsPerBar)) + 0.5;
+			const x = Math.round(xForTime(barInfo(tabRef, b).start)) + 0.5;
 			tctx.beginPath();
 			tctx.moveTo(x, 0);
 			tctx.lineTo(x, h);
@@ -5403,6 +6200,7 @@
 			}
 			const savedStyle = localStorage.getItem('tabutabu.spectroStyle');
 			if (savedStyle === 'spectrum' || savedStyle === 'plain') spectroStyle = savedStyle;
+			muteRefInBackground = localStorage.getItem('tabutabu.muteRefInBackground') === '1';
 			const savedListen = localStorage.getItem('tabutabu.listenChannel');
 			if (savedListen === 'left' || savedListen === 'right') listenChannel = savedListen;
 			// Grid (incl. triplets). Unknown values fall back to the default.
@@ -5433,19 +6231,15 @@
 				tab = authorTab;
 				history = makeHistory();
 				fileName = null;
-				const beats = authorTab.timeSignature[0];
 				const savedBar = Number(savedBarRaw);
 				const savedBeat = Number(savedBeatRaw);
 				const barIdx = Number.isFinite(savedBar) ? Math.max(0, Math.floor(savedBar)) : 0;
+				const bar = barInfo(authorTab, barIdx);
 				const beatIdx = Number.isFinite(savedBeat)
-					? Math.max(0, Math.min(beats, Math.floor(savedBeat)))
+					? Math.max(0, Math.min(bar.beats, Math.floor(savedBeat)))
 					: 0;
 				authorFocus = { barIdx, beatIdx };
-				const secondsPerBeat = authorTab.secondsPerBar / beats;
-				currentTime =
-					beatIdx === 0
-						? barIdx * authorTab.secondsPerBar
-						: barIdx * authorTab.secondsPerBar + (beatIdx - 1) * secondsPerBeat;
+				currentTime = beatIdx === 0 ? bar.start : bar.start + (beatIdx - 1) * bar.beatLength;
 			} else {
 				const saved = (await idbGet('lastFile')) as
 					{ name: string; buffer: ArrayBuffer; isDawproject: boolean } | undefined;
@@ -5471,7 +6265,7 @@
 				const blob = new Blob([savedVideo.buffer], { type: savedVideo.type });
 				videoUrl = URL.createObjectURL(blob);
 				videoFileName = savedVideo.name;
-				setReferenceAudio(savedVideo.buffer, savedVideo.type, savedVideo.name);
+				setReferenceAudio(savedVideo.buffer, savedVideo.type, savedVideo.name, true);
 			}
 		} catch {
 			// ignore
@@ -5558,6 +6352,7 @@
 	$effect(() => put('tabutabu.refView', refView));
 	$effect(() => put('tabutabu.spectroChannel', spectroChannel));
 	$effect(() => put('tabutabu.listenChannel', listenChannel));
+	$effect(() => put('tabutabu.muteRefInBackground', muteRefInBackground ? '1' : '0'));
 	$effect(() => put('tabutabu.spectroStyle', spectroStyle));
 	$effect(() => put('tabutabu.videoVolume', String(videoVolume)));
 	// Persist author-mode playback focus so the playhead / focus band don't
@@ -5650,6 +6445,17 @@
 					handleRedo();
 					return;
 				}
+				if (ck === 'd' && mode === 'author' && !e.shiftKey) {
+					e.preventDefault();
+					duplicateBar();
+					return;
+				}
+				if ((ck === 'c' || ck === 'v') && mode === 'author' && !e.shiftKey) {
+					e.preventDefault();
+					if (ck === 'c') copyBar();
+					else pasteBar();
+					return;
+				}
 				// Ctrl+←/→ (power-chord tools) — previous / next shape.
 				if (
 					(e.code === 'ArrowLeft' || e.code === 'ArrowRight') &&
@@ -5689,11 +6495,12 @@
 
 			// Author-mode-only keys.
 			if (mode === 'author') {
+				if (numpadKey(e)) return;
 				// Tool selector (1-6 and 0). Pressing the same digit that's
 				// already active toggles the palm-mute variant.
-				// Typed digit first (layout-aware, includes the numpad); fall
-				// back to the physical number row for layouts like AZERTY where
-				// the unshifted number row types symbols.
+				// Typed digit first (layout-aware); fall back to the physical
+				// number row for layouts like AZERTY where the unshifted number
+				// row types symbols. (Numpad digits enter notes, see numpadKey.)
 				const digitChar = /^[0-6]$/.test(e.key)
 					? e.key
 					: /^Digit[0-6]$/.test(e.code)
@@ -5761,11 +6568,11 @@
 				// repeat is swallowed so holding B/S/V doesn't re-toggle.
 				const k = e.key.toLowerCase();
 				if (pmPaint) {
-					if (k === 'm' || k === 'r' || e.code === pmPaint.code) e.preventDefault();
+					if (k in MOMENT_KEYS || e.code === pmPaint.code) e.preventDefault();
 					if (e.code === pmPaint.code) return;
 				}
 				if (
-					(k === 'm' || k === 'r') &&
+					(k === 'm' || k === 'r' || k === 'p') &&
 					hoverPos &&
 					!authorGesture &&
 					!artHold &&
@@ -5851,8 +6658,8 @@
 					authorAdvanceFocus(dir);
 					return;
 				}
-				const beatSec = tab.secondsPerBar / tab.timeSignature[0];
-				const step = e.shiftKey ? beatSec * tab.timeSignature[0] : beatSec;
+				const bar = barAt(tab, currentTime);
+				const step = e.shiftKey ? bar.length : bar.beatLength;
 				seekBy(dir * step);
 			} else if (mode === 'author' && (e.code === 'ArrowUp' || e.code === 'ArrowDown')) {
 				if (!tab) return;
@@ -5867,8 +6674,9 @@
 					sweepAction({ kind: 'pattern', dir: e.code === 'ArrowDown' ? 1 : -1 });
 					return;
 				}
-				// Down = next bar (whole-bar focus), Up = previous bar.
-				const delta = e.code === 'ArrowDown' ? 1 : -1;
+				// Down = next bar (whole-bar focus), Up = previous bar — or, with
+				// a single beat focused, Up = that beat's whole bar.
+				const delta = e.code === 'ArrowDown' ? 1 : authorFocus.beatIdx !== 0 ? 0 : -1;
 				const nextBar = Math.max(0, authorFocus.barIdx + delta);
 				authorFocus = { barIdx: nextBar, beatIdx: 0 };
 				syncPlayheadToFocus();
@@ -5880,6 +6688,12 @@
 			// Matched on the physical key recorded at press time, so the
 			// release is caught even if Shift changes the typed character.
 			if (artHold && e.code === artHold.code) endArtHold();
+			// A numpad-entered note is heard while its key is held (releasing
+			// an earlier key while typing fast doesn't cut the newer note).
+			if (e.code === numpadPreviewKey) {
+				synth.stopPreview();
+				numpadPreviewKey = null;
+			}
 			if (pmPaint && e.code === pmPaint.code) endPmPaint();
 		};
 		const onBlur = () => {
@@ -6066,6 +6880,42 @@
 								}}
 							/>
 						</label>
+						{#if tab}
+							<button
+								class="menu-item"
+								onclick={() => {
+									openMenu = null;
+									exportMidi();
+								}}
+								title="The tab's notes plus every tempo and time-signature change as a MIDI file — bar 1 at the start, so a DAW gets the same bars (line the audio up there with the offset)"
+							>
+								<span class="i-lucide-download"></span>
+								<span>Export MIDI (tempo map + notes)…</span>
+							</button>
+							<button
+								class="menu-item"
+								onclick={() => {
+									openMenu = null;
+									exportMidi(true);
+								}}
+								title="One bar of clicks to loop in a DAW, in the selected bar's time signature — beat 1 on C1 (note 36), the other beats on C#1 (37): the first two pads of a drum machine (e.g. Bitwig's Drum Machine). Shorten the loop for shorter bars."
+							>
+								<span class="i-lucide-download"></span>
+								<span>Export one-bar metronome (MIDI)…</span>
+							</button>
+						{/if}
+						{#if stems?.status === 'done'}
+							<a
+								class="menu-item"
+								href={`/api/separate/${stems.id}/export?name=${encodeURIComponent(videoFileName ?? 'stems')}`}
+								download
+								onclick={() => (openMenu = null)}
+								title="Every separated instrument as a 24-bit WAV (zipped), all starting where the original does — ready to drop into a DAW"
+							>
+								<span class="i-lucide-download"></span>
+								<span>Export stems (WAV)…</span>
+							</a>
+						{/if}
 						{#if videoFileName}
 							<button
 								class="menu-item"
@@ -6265,6 +7115,13 @@
 						>
 							<input type="checkbox" bind:checked={preservePositionOnStart} />
 							<span>Preserve position on Start</span>
+						</label>
+						<label
+							class="check"
+							title="Silence the reference audio (and stems) whenever this window isn't focused — so it doesn't double up with the same audio playing in your DAW. Tabutabu's own synth and metronome still play."
+						>
+							<input type="checkbox" bind:checked={muteRefInBackground} />
+							<span>Mute reference when in the background</span>
 						</label>
 						<label
 							class="check"
@@ -6540,11 +7397,11 @@
 						<dt>Drag ←/→</dt>
 						<dd>fret</dd>
 						<dt>Drag ↑/↓</dt>
-						<dd>octave</dd>
+						<dd>next / previous shape</dd>
 						<dt>Ctrl+←/→</dt>
 						<dd>shape (over a chord's lowest note: reshape it)</dd>
 						<dt>Drag lowest</dt>
-						<dd>move the chord</dd>
+						<dd>move the chord (↑/↓: its shape)</dd>
 						<dt>Drag other</dt>
 						<dd>edit just that note</dd>
 					{:else if currentTool === 4}
@@ -6651,7 +7508,7 @@
 				<video
 					bind:this={videoElement}
 					src={videoUrl}
-					muted={!videoAudioOn || stemPlaying}
+					muted={!videoAudioOn || stemPlaying || refBackgroundMuted}
 					playsinline
 					preload="auto"
 					class="ref-video"
@@ -6822,12 +7679,8 @@
 				</button>
 				<span class="mono position">
 					{#if tab}
-						{Math.floor(currentTime / tab.secondsPerBar) + 1}.{Math.floor(
-							(currentTime % tab.secondsPerBar) / (tab.secondsPerBar / tab.timeSignature[0])
-						) + 1}
-						<span class="dim"
-							>/ {Math.max(1, Math.ceil(effectiveDurationSec / tab.secondsPerBar))} bars</span
-						>
+						{barBeat(tab, currentTime).bar}.{barBeat(tab, currentTime).beat}
+						<span class="dim">/ {barCount(tab, effectiveDurationSec)} bars</span>
 					{:else}
 						—
 					{/if}
@@ -6926,6 +7779,15 @@
 						<button class="nudge" onclick={() => nudgeOffset(0.01)}>+.01</button>
 						<button class="nudge" onclick={() => nudgeOffset(0.1)}>+.1</button>
 						<button class="nudge" onclick={() => nudgeOffset(1)}>+1s</button>
+						<button
+							class="nudge"
+							disabled={autoOffsetState === 'busy'}
+							onclick={autoOffset}
+							title={autoOffsetState === 'failed'
+								? "Couldn't find where the music starts — set the offset by hand"
+								: 'Set the offset from the audio: bar 1 starts on the first clear hit'}
+							>{autoOffsetState === 'busy' ? '…' : 'Auto'}</button
+						>
 					</span>
 					{#if tab}
 						<span
@@ -6938,24 +7800,88 @@
 								min="20"
 								max="400"
 								step="any"
-								value={+tab.bpm.toFixed(3)}
+								value={+(selectedSection?.bpm ?? tab.bpm).toFixed(3)}
 								onchange={(e) => {
 									setTempo(Number(e.currentTarget.value));
-									e.currentTarget.value = String(+(tab?.bpm ?? 0).toFixed(3));
+									e.currentTarget.value = String(+(selectedSection?.bpm ?? 0).toFixed(3));
 								}}
-								title="Tempo in BPM — type a value (decimals are fine) and press Enter. Notes keep their place in the bar."
+								title="Tempo (quarter notes per minute) of the selected bar's section — type a value (decimals are fine) and press Enter. Notes keep their place in the bar."
 							/>
 							<span class="mono">bpm</span>
+							<input
+								class="ts-input"
+								type="number"
+								min="1"
+								max="32"
+								step="1"
+								value={selectedSection?.timeSignature[0] ?? 4}
+								onchange={(e) => {
+									setTimeSignature(
+										Number(e.currentTarget.value),
+										selectedSection?.timeSignature[1] ?? 4
+									);
+									e.currentTarget.value = String(selectedSection?.timeSignature[0] ?? 4);
+								}}
+								title="Beats per bar in the selected bar's section"
+							/>
+							<span class="mono">/</span>
+							<select
+								class="ts-select"
+								value={selectedSection?.timeSignature[1] ?? 4}
+								onchange={(e) =>
+									setTimeSignature(
+										selectedSection?.timeSignature[0] ?? 4,
+										Number(e.currentTarget.value)
+									)}
+								title="Beat note value in the selected bar's section"
+							>
+								{#each [2, 4, 8, 16] as d (d)}
+									<option value={d}>{d}</option>
+								{/each}
+							</select>
 							<button onclick={tapTempo}>Tap</button>
-							{#if tapTimes.length > 0}
-								<span class="hint">{tapBpm !== null ? `~${tapBpm}` : tapTimes.length}</span>
-							{/if}
-							{#if tapBpm !== null}
-								<button onclick={applyTapBpm}>Apply</button>
-							{/if}
-							{#if tapTimes.length > 0}
-								<button class="link" onclick={resetTaps}>reset</button>
-							{/if}
+							<!-- Always laid out (just invisible until there are taps) so
+							nothing around the Tap button moves while tapping. -->
+							<span class="tap-result" class:slot-off={tapTimes.length === 0}>
+								<span class="hint tap-hint"
+									>{tapBpm !== null ? `~${tapBpm}` : tapTimes.length || ''}</span
+								>
+								<button
+									class:slot-off={tapBpm === null}
+									disabled={tapBpm === null}
+									onclick={applyTapBpm}>Apply</button
+								>
+								<button class="link" disabled={tapTimes.length === 0} onclick={resetTaps}
+									>reset</button
+								>
+							</span>
+							<!-- Tempo sections (tempo / time-signature changes). -->
+							<span class="sections">
+								<button
+									class="nudge"
+									disabled={!selectedSection ||
+										selectedSection.bar === 0 ||
+										selectedSection.startBar === selectedSection.bar}
+									onclick={addTempoChange}
+									title={selectedSection && selectedSection.bar > 0
+										? `Start a new tempo / time-signature section at bar ${selectedSection.bar + 1} (then set its tempo)`
+										: 'Select a bar after the first to start a new tempo section there'}
+									>+ bar {(selectedSection?.bar ?? 0) + 1}</button
+								>
+								<button
+									class="nudge"
+									class:slot-off={!selectedSection ||
+										selectedSection.startBar !== selectedSection.bar ||
+										selectedSection.bar === 0}
+									onclick={removeTempoChange}
+									title="Remove the section starting at this bar (it joins the one before)"
+									>×</button
+								>
+								<span class="hint section-label" class:slot-off={(selectedSection?.count ?? 1) < 2}
+									>§{(selectedSection?.index ?? 0) + 1} from bar {(selectedSection?.startBar ?? 0) +
+										1}</span
+								>
+							</span>
 						</span>
 					{/if}
 				{/if}
@@ -7002,7 +7928,7 @@
 						<dd>play through</dd>
 						{#if mode === 'author' && stems?.status === 'done'}
 							<dt>Shift+Space</dt>
-							<dd>… hearing the selected stem</dd>
+							<dd>… hearing the selected source</dd>
 						{/if}
 						<dt>← / →</dt>
 						<dd>previous / next beat</dd>
@@ -7033,6 +7959,8 @@
 							<dd>palm mute (whole moment)</dd>
 							<dt>R</dt>
 							<dd>let ring (whole moment)</dd>
+							<dt>P</dt>
+							<dd>pick slide (whole moment)</dd>
 							<dt>G</dt>
 							<dd>ghost</dd>
 							<dt>H</dt>
@@ -7062,6 +7990,28 @@
 							<dd>click / drag to erase</dd>
 							<dt>Ctrl+Z / Y</dt>
 							<dd>undo / redo</dd>
+							<dt>Ctrl+D</dt>
+							<dd>copy the bar into the next bar</dd>
+							<dt>Ctrl+C / V</dt>
+							<dd>copy the bar / paste over the bar</dd>
+						</dl>
+					</section>
+					<section>
+						<h5>Numpad entry</h5>
+						<dl class="keys">
+							<dt>1–9</dt>
+							<dd>next step, fret −4 … +4 from the outlined note</dd>
+							<dt>+ / Enter</dt>
+							<dd>a string higher / lower</dd>
+							<dt>0</dt>
+							<dd>last entered note becomes the reference</dd>
+							<dt>.</dt>
+							<dd>
+								hovered note becomes the reference (box stays; also the regular . key outside chord
+								/ arp / sweep)
+							</dd>
+							<dt>/ and *</dt>
+							<dd>move the next-note box left / right</dd>
 						</dl>
 					</section>
 					{#if videoUrl}
@@ -7079,6 +8029,8 @@
 									<dt>Shift+hold</dt>
 									<dd>… plus its harmonics</dd>
 								{/if}
+								<dt>Alt+click</dt>
+								<dd>add a note at that pitch below</dd>
 								<dt>… drag ↑/↓</dt>
 								<dd>move the band</dd>
 							</dl>
@@ -7343,6 +8295,10 @@
 		padding: 6px 8px;
 		font-weight: 500;
 		cursor: pointer;
+	}
+	/* A link styled like the menu's buttons. */
+	a.menu-item {
+		text-decoration: none;
 	}
 	.menu-item:hover:not(:disabled) {
 		background: #1f2a36;
@@ -7684,6 +8640,50 @@
 		padding: 2px 4px;
 		font-family: 'JetBrains Mono Variable', ui-monospace, monospace;
 	}
+	.transport .tempo .ts-input {
+		width: 40px;
+		background: #0b0f14;
+		color: #e6eef7;
+		border: 1px solid #2a3543;
+		border-radius: 4px;
+		padding: 2px 4px;
+		font-family: 'JetBrains Mono Variable', ui-monospace, monospace;
+	}
+	.transport .tempo .ts-select {
+		background: #0b0f14;
+		color: #e6eef7;
+		border: 1px solid #2a3543;
+		border-radius: 4px;
+		padding: 1px 2px;
+		font-family: 'JetBrains Mono Variable', ui-monospace, monospace;
+	}
+	.transport .tempo .sections {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		margin-left: 6px;
+	}
+	.transport .tempo .section-label {
+		display: inline-block;
+		min-width: 14ch;
+		font-variant-numeric: tabular-nums;
+	}
+	.transport .tempo .tap-result {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+	}
+	.transport .tempo .tap-hint {
+		display: inline-block;
+		min-width: 5ch;
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+	}
+	/* Laid out but invisible (keeps neighbours from moving). Not "hidden":
+	   that's a UnoCSS utility name and gets rewritten. */
+	.transport .tempo .slot-off {
+		visibility: hidden;
+	}
 	.transport .tempo .hint,
 	.menu-row .hint {
 		margin-left: 0;
@@ -7928,7 +8928,12 @@
 		font-weight: 600;
 		cursor: pointer;
 	}
-	button.nudge:hover {
+	button.nudge:disabled {
+		background: #161d25;
+		color: #56616f;
+		cursor: not-allowed;
+	}
+	button.nudge:hover:not(:disabled) {
 		background: #232c36;
 	}
 	.err {

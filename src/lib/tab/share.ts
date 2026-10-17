@@ -27,7 +27,7 @@
 //     [u8 articulation count, then each articulation: u8 code + params]
 // MIDI pitch isn't stored: it's the tuning's open string + fret.
 
-import type { Articulation, Tab, TabNote } from './types';
+import type { Articulation, Tab, TabNote, TempoChange } from './types';
 
 export type SharedTab = { tab: Tab; tuningKey: string; videoOffsetSec: number };
 
@@ -49,7 +49,8 @@ const CODE = {
 	bendRelease: 11,
 	harmonic: 12,
 	pinchHarmonic: 13,
-	vibrato: 14
+	vibrato: 14,
+	pickSlide: 15
 } as const;
 
 // ---- bytes -----------------------------------------------------------------
@@ -81,6 +82,9 @@ class Writer {
 class Reader {
 	pos = 0;
 	constructor(private b: Uint8Array) {}
+	get done(): boolean {
+		return this.pos >= this.b.length;
+	}
 	u8(): number {
 		if (this.pos >= this.b.length) throw new Error('Link data is cut short');
 		return this.b[this.pos++];
@@ -162,6 +166,8 @@ function readArticulation(
 			return { kind: 'tap' };
 		case CODE.letRing:
 			return { kind: 'letRing' };
+		case CODE.pickSlide:
+			return { kind: 'pickSlide' };
 		case CODE.slideUp:
 			return { kind: 'slideUp', fromSemitones: r.u8() };
 		case CODE.slideDown:
@@ -217,6 +223,18 @@ function tabToBytes(s: SharedTab): Uint8Array {
 			for (const a of arts) writeArticulation(w, a, ticks, toTicks);
 		}
 	}
+	// Tempo / time-signature changes and the exact length (optional block:
+	// older links end before it, older apps ignore it).
+	if (tab.tempoMap && tab.tempoMap.length > 1) {
+		w.varint(tab.tempoMap.length);
+		for (const c of tab.tempoMap) {
+			w.varint(c.bar);
+			w.varint(Math.round(c.bpm * 100));
+			w.u8(c.timeSignature[0]);
+			w.u8(c.timeSignature[1]);
+		}
+		w.varint(Math.round(tab.durationSec * 1000));
+	}
 	return Uint8Array.from(w.bytes);
 }
 
@@ -262,6 +280,16 @@ function bytesToTab(bytes: Uint8Array, openNotes: (tuningKey: string) => number[
 			articulations
 		});
 	}
+	let tempoMap: TempoChange[] | undefined;
+	let durationSec = bars * secondsPerBar;
+	if (!r.done) {
+		tempoMap = [];
+		const n = r.varint();
+		for (let i = 0; i < n; i++) {
+			tempoMap.push({ bar: r.varint(), bpm: r.varint() / 100, timeSignature: [r.u8(), r.u8()] });
+		}
+		durationSec = r.varint() / 1000;
+	}
 	return {
 		tuningKey,
 		videoOffsetSec,
@@ -270,7 +298,8 @@ function bytesToTab(bytes: Uint8Array, openNotes: (tuningKey: string) => number[
 			bpm,
 			timeSignature,
 			secondsPerBar,
-			durationSec: bars * secondsPerBar,
+			tempoMap,
+			durationSec,
 			trimmedLeadingSec
 		}
 	};

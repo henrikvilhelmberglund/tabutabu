@@ -28,20 +28,28 @@ export type Articulation =
 	| { kind: 'hammerOn' }
 	| { kind: 'pullOff' }
 	| { kind: 'tap' }
+	// Pick slide ("P.S."): the pick scraped down the strings from this note,
+	// instead of picking it.
+	| { kind: 'pickSlide' }
 	// Note is "let ring" — playback keeps the pitch alive past the bar
 	// boundary (the default is to mute at bar end), and it's cut only by
 	// the next note fretted on the SAME string, mirroring real guitar
 	// physics.
 	| { kind: 'letRing' };
 
+// A tempo / time-signature change starting at a bar (see tempo.ts).
+export type TempoChange = { bar: number; bpm: number; timeSignature: [number, number] };
+
 export type Tab = {
 	notes: TabNote[];
 	durationSec: number;
+	// The first section's tempo (quarter notes per minute), time signature
+	// ([beatsPerBar, beatUnit], e.g. [6, 8]) and bar length — the whole song
+	// unless `tempoMap` has changes. Use tempo.ts for bar / beat positions.
 	bpm: number;
-	// [beatsPerBar, beatUnit] — e.g. [4, 4] for 4/4, [6, 8] for 6/8.
 	timeSignature: [number, number];
-	// Derived: seconds per bar assuming the first tempo/time-sig stay constant.
-	// Mid-song changes aren't tracked yet.
 	secondsPerBar: number;
+	// Tempo / time-signature changes, first at bar 0 (absent = no changes).
+	tempoMap?: TempoChange[];
 	trimmedLeadingSec: number;
 };

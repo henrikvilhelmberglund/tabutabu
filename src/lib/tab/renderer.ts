@@ -1,6 +1,7 @@
 import type { Tab } from './types';
 import type { Tuning } from './tuning';
 import { STRING_COUNT } from './tuning';
+import { barAt, barInfo } from './tempo';
 
 export type RenderMode = 'page' | 'scroll';
 
@@ -168,6 +169,77 @@ export function renderTabFrame(
 	}
 }
 
+// Where the tab is drawn: time → x for a canvas `width` wide, plus (page
+// mode) the page shown. Shared with the page's overlay and pointer maths, so
+// what's drawn and what's clicked always agree.
+//   Page mode: pages of barsPerPage bars (bar lengths may differ with tempo
+//   changes), each squeezed into the width with a peek of peekBeats beats.
+//   Scroll mode: a steady pace, from the song's first bars.
+export type TabLayout = {
+	timeToX: (t: number) => number;
+	xToTime: (x: number) => number;
+	pxPerSec: number;
+	pageStart: number;
+	pageEnd: number;
+	peekDur: number;
+	// Page mode: the page number and its first bar.
+	pageIndex: number;
+	firstBar: number;
+};
+
+export function tabLayout(
+	tab: Tab,
+	currentTime: number,
+	cfg: Pick<
+		RenderConfig,
+		| 'width'
+		| 'paddingX'
+		| 'playheadFraction'
+		| 'barsPerPage'
+		| 'peekBeats'
+		| 'mode'
+		| 'pixelsPerSecond'
+	>
+): TabLayout {
+	const usableWidth = cfg.width - cfg.paddingX * 2;
+	const peekBeats = Math.max(0, cfg.peekBeats);
+	if (cfg.mode === 'page') {
+		const pageIndex = Math.floor(barAt(tab, currentTime).index / Math.max(1, cfg.barsPerPage));
+		const firstBar = pageIndex * cfg.barsPerPage;
+		const pageStart = barInfo(tab, firstBar).start;
+		const after = barInfo(tab, firstBar + cfg.barsPerPage);
+		const pageEnd = after.start;
+		const peekDur = peekBeats * after.beatLength;
+		const pxPerSec = usableWidth / Math.max(1e-6, pageEnd - pageStart + peekDur);
+		return {
+			timeToX: (t) => cfg.paddingX + (t - pageStart) * pxPerSec,
+			xToTime: (x) => pageStart + (x - cfg.paddingX) / pxPerSec,
+			pxPerSec,
+			pageStart,
+			pageEnd,
+			peekDur,
+			pageIndex,
+			firstBar
+		};
+	}
+	const first = barInfo(tab, 0);
+	const peekDur = peekBeats * first.beatLength;
+	const totalDur = cfg.barsPerPage * first.length + peekDur;
+	const pxPerSec = totalDur > 0 && usableWidth > 0 ? usableWidth / totalDur : cfg.pixelsPerSecond;
+	const playheadX = cfg.width * cfg.playheadFraction;
+	const pageStart = currentTime - playheadX / pxPerSec;
+	return {
+		timeToX: (t) => playheadX + (t - currentTime) * pxPerSec,
+		xToTime: (x) => currentTime + (x - playheadX) / pxPerSec,
+		pxPerSec,
+		pageStart,
+		pageEnd: pageStart + totalDur,
+		peekDur,
+		pageIndex: 0,
+		firstBar: 0
+	};
+}
+
 // Page mode: the tab holds still, showing a fixed window of N bars. The playhead
 // sweeps across from left to right; when it exits the right edge, the window
 // jumps to the next N-bar block.
@@ -179,33 +251,18 @@ function renderPage(
 	cfg: RenderConfig
 ): void {
 	const { width, height, paddingX, paddingTop, paddingBottom, barsPerPage } = cfg;
-	const pageDur = tab.secondsPerBar * barsPerPage;
-	if (pageDur <= 0) return;
-
-	const pageIndex = Math.floor(currentTime / pageDur);
-	const pageStart = pageIndex * pageDur;
-	const pageEnd = pageStart + pageDur;
-
-	// Layout: the strip after left/right padding is split between the current page
-	// and an optional peek at the next bar, sized in beats (not width fraction).
-	const [beatsPerBar0] = tab.timeSignature;
-	const secondsPerBeat0 = tab.secondsPerBar / beatsPerBar0;
-	const peekDur = Math.max(0, cfg.peekBeats) * secondsPerBeat0;
-	const totalDur = pageDur + peekDur;
-	const usableWidth = width - paddingX * 2;
-	const pxPerSec = usableWidth / totalDur;
-	const timeToX = (t: number) => paddingX + (t - pageStart) * pxPerSec;
+	const layout = tabLayout(tab, currentTime, cfg);
+	const { timeToX, pxPerSec, pageStart, pageEnd, peekDur, firstBar } = layout;
+	if (pageEnd <= pageStart) return;
 	const peekBoundaryX = timeToX(pageEnd);
 
 	drawStrings(ctx, cfg, tuning);
 
 	// Bar and beat gridlines, spanning the current page + the peek (1 extra bar
 	// into the peek zone, drawn dimmer).
-	const beatsPerBar = beatsPerBar0;
-	const secondsPerBeat = secondsPerBeat0;
-	const totalBars = barsPerPage + (peekDur > 0 ? Math.ceil(peekDur / tab.secondsPerBar) : 0);
+	const totalBars = barsPerPage + (peekDur > 0 ? 1 : 0);
 	for (let i = 0; i <= totalBars; i++) {
-		const t = pageStart + i * tab.secondsPerBar;
+		const t = barInfo(tab, firstBar + i).start;
 		const x = timeToX(t);
 		if (x > width - paddingX + 1) break;
 		ctx.strokeStyle = COLORS.barline;
@@ -222,15 +279,16 @@ function renderPage(
 			ctx.font = '600 15px "JetBrains Mono Variable", ui-monospace, Menlo, Consolas, monospace';
 			ctx.textAlign = 'center';
 			ctx.textBaseline = 'top';
-			ctx.fillText(String(pageIndex * barsPerPage + i + 1), x, 3);
+			ctx.fillText(String(firstBar + i + 1), x, 3);
 			ctx.globalAlpha = 1;
 		}
 	}
 	ctx.strokeStyle = COLORS.beatline;
 	ctx.lineWidth = 1;
 	for (let b = 0; b < totalBars; b++) {
-		for (let beat = 1; beat < beatsPerBar; beat++) {
-			const t = pageStart + b * tab.secondsPerBar + beat * secondsPerBeat;
+		const bar = barInfo(tab, firstBar + b);
+		for (let beat = 1; beat < bar.beats; beat++) {
+			const t = bar.start + beat * bar.beatLength;
 			const x = timeToX(t);
 			if (x > width - paddingX + 1) break;
 			ctx.globalAlpha = b >= barsPerPage ? 0.5 : 1;
@@ -244,16 +302,7 @@ function renderPage(
 
 	// Playhead — either a thin line, a stepped-highlight column, or both.
 	if (currentTime <= pageEnd) {
-		drawPlayheadForStyle(
-			ctx,
-			cfg,
-			currentTime,
-			timeToX,
-			tab.secondsPerBar,
-			beatsPerBar0,
-			paddingTop,
-			height - paddingBottom
-		);
+		drawPlayheadForStyle(ctx, cfg, tab, currentTime, timeToX);
 	}
 
 	// Notes: current page at full opacity, peek notes dimmed. Draw peek first,
@@ -302,34 +351,16 @@ function renderScroll(
 	currentTime: number,
 	cfg: RenderConfig
 ): void {
-	const { width, height, playheadFraction, paddingX, paddingTop, paddingBottom } = cfg;
+	const { width, height, playheadFraction, paddingTop, paddingBottom } = cfg;
 
-	// Derive pixels-per-second from the same bars/page + peek settings that
-	// page mode uses so switching modes doesn't change the visual pace. Falls
-	// back to the config's explicit pixelsPerSecond only if tempo/time-sig
-	// aren't available.
-	const [beatsPerBar] = tab.timeSignature;
-	const secondsPerBeat = beatsPerBar > 0 ? tab.secondsPerBar / beatsPerBar : 0;
-	const totalPageDur =
-		cfg.barsPerPage * tab.secondsPerBar + Math.max(0, cfg.peekBeats) * secondsPerBeat;
-	const usableWidth = width - paddingX * 2;
-	const pixelsPerSecond =
-		totalPageDur > 0 && usableWidth > 0 ? usableWidth / totalPageDur : cfg.pixelsPerSecond;
+	// Same pace as page mode (bars per page + peek, from the song's first
+	// bars), so switching modes doesn't change it.
+	const { timeToX, pxPerSec: pixelsPerSecond } = tabLayout(tab, currentTime, cfg);
 
 	drawStrings(ctx, cfg, tuning);
 
 	const playheadX = width * playheadFraction;
-	const timeToX = (t: number) => playheadX + (t - currentTime) * pixelsPerSecond;
-	drawPlayheadForStyle(
-		ctx,
-		cfg,
-		currentTime,
-		timeToX,
-		tab.secondsPerBar,
-		tab.timeSignature[0],
-		paddingTop,
-		height - paddingBottom
-	);
+	drawPlayheadForStyle(ctx, cfg, tab, currentTime, timeToX);
 
 	const secondsLeft = playheadX / pixelsPerSecond;
 	const secondsRight = (width - playheadX) / pixelsPerSecond;
@@ -353,7 +384,6 @@ function renderScroll(
 		visibleInScroll
 	);
 
-	void paddingX;
 	void paddingBottom;
 }
 
@@ -439,21 +469,18 @@ function drawPlayhead(
 function drawPlayheadForStyle(
 	ctx: CanvasRenderingContext2D,
 	cfg: RenderConfig,
+	tab: Tab,
 	currentTime: number,
-	timeToX: (t: number) => number,
-	secondsPerBar: number,
-	beatsPerBar: number,
-	yTop: number,
-	yBottom: number
+	timeToX: (t: number) => number
 ): void {
 	if (cfg.playheadStyle === 'beat' || cfg.playheadStyle === 'bar') {
-		const step =
-			cfg.playheadStyle === 'bar' ? secondsPerBar : secondsPerBar / Math.max(1, beatsPerBar);
-		if (step > 0) {
-			const idx = Math.floor(currentTime / step + 1e-9);
-			const snapped = idx * step;
-			drawPlayhead(ctx, cfg, timeToX(snapped), COLORS.playheadStepped);
-		}
+		const bar = barAt(tab, currentTime);
+		const snapped =
+			cfg.playheadStyle === 'bar'
+				? bar.start
+				: bar.start +
+					Math.floor((currentTime - bar.start) / bar.beatLength + 1e-9) * bar.beatLength;
+		drawPlayhead(ctx, cfg, timeToX(snapped), COLORS.playheadStepped);
 		return;
 	}
 	drawPlayhead(ctx, cfg, timeToX(currentTime));
@@ -474,6 +501,7 @@ function drawNotes(
 	drawPalmMuteMarkers(ctx, tab, cfg, timeToX, visible);
 	drawLetRingMarkers(ctx, tab, cfg, timeToX, visible);
 	drawPinchHarmonicMarkers(ctx, tab, cfg, timeToX, visible);
+	drawPickSlideMarkers(ctx, tab, cfg, timeToX, visible);
 
 	ctx.textBaseline = 'middle';
 
@@ -502,6 +530,19 @@ function drawNotes(
 		active: boolean;
 		prev: (typeof tab.notes)[number] | null;
 	};
+	// A string plays one note at a time, so a note stops being "active" when
+	// the next note on its string starts, even if its own length runs on
+	// (fast runs of notes placed with the default length would otherwise all
+	// light up together).
+	const nextOnString = new Map<string, number>();
+	const laterByString = new Map<number, number>();
+	for (let i = tab.notes.length - 1; i >= 0; i--) {
+		const n = tab.notes[i];
+		const later = laterByString.get(n.stringIndex);
+		if (later !== undefined && later > n.time) nextOnString.set(n.id, later);
+		laterByString.set(n.stringIndex, n.time);
+	}
+
 	const placed: Placed[] = [];
 	for (const n of tab.notes) {
 		const prev = lastByString.get(n.stringIndex) ?? null;
@@ -511,14 +552,19 @@ function drawNotes(
 		const x = timeToX(n.time);
 		if (x < stringLeft - 4 || x > stringRight + 4) continue;
 		const y = cfg.paddingTop + n.stringIndex * stringGap;
-		const active = currentTime >= n.time && currentTime <= n.time + n.duration;
+		const active =
+			currentTime >= n.time &&
+			currentTime <= n.time + n.duration &&
+			currentTime < (nextOnString.get(n.id) ?? Infinity);
 		placed.push({ n, x, y, active, prev });
 	}
 
 	// Pass 1: duration bars + note masks + inline h/p masks.
 	for (const p of placed) {
 		if (cfg.showNoteLengths && p.n.duration > 0.05) {
-			const barW = durationToWidth(p.n.time, p.n.duration);
+			// Cut at the next note on the string, like the sound is.
+			const shown = Math.min(p.n.duration, (nextOnString.get(p.n.id) ?? Infinity) - p.n.time);
+			const barW = durationToWidth(p.n.time, shown);
 			ctx.fillStyle = p.active ? COLORS.durationBarActive : COLORS.durationBarIdle;
 			ctx.fillRect(p.x, p.y - stringGap * 0.38, barW, stringGap * 0.76);
 		}
@@ -791,6 +837,18 @@ function drawNoteWithArticulations(
 		ctx.stroke();
 	}
 
+	// Pick slide: a line falling away to the right of the fret.
+	if (pass === 'text' && has('pickSlide')) {
+		const x0 = suffixStartX + suffixW + 3;
+		const x1 = x0 + Math.max(14, Math.min(36, durationPx - fretW - suffixW - 6));
+		ctx.strokeStyle = decoColor;
+		ctx.lineWidth = 1.4;
+		ctx.beginPath();
+		ctx.moveTo(x0, y - 5);
+		ctx.lineTo(x1, y + 7);
+		ctx.stroke();
+	}
+
 	// Slide connector — thin diagonal line spanning the slideSpace gap between
 	// the origin fret text and the played fret text on the same string.
 	if (pass === 'text' && (slideUp || slideDown)) {
@@ -952,6 +1010,32 @@ function drawPinchHarmonicMarkers(
 		ctx.textAlign = 'center';
 		ctx.textBaseline = 'middle';
 		ctx.fillText('P.H.', x, y);
+	}
+}
+
+// Pick slide: a "P.S." label above the staff (one per time position), in
+// the same row as P.H. / L.R. — moving up to the PM row when the moment also
+// lets ring. The falling line after the fret is drawn with the note.
+function drawPickSlideMarkers(
+	ctx: CanvasRenderingContext2D,
+	tab: Tab,
+	cfg: RenderConfig,
+	timeToX: (t: number) => number,
+	visible: (n: (typeof tab.notes)[number]) => boolean
+): void {
+	let lastX = -Infinity;
+	for (const n of tab.notes) {
+		if (!visible(n) || !n.articulations?.some((a) => a.kind === 'pickSlide')) continue;
+		const x = timeToX(n.time);
+		if (Math.abs(x - lastX) < 1) continue;
+		lastX = x;
+		const ringsToo = n.articulations.some((a) => a.kind === 'letRing');
+		const y = cfg.paddingTop - (ringsToo ? PM_LANE_OFFSET : LR_LANE_OFFSET);
+		ctx.fillStyle = COLORS.articulation;
+		ctx.font = '700 12px "JetBrains Mono Variable", ui-monospace, Menlo, Consolas, monospace';
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'middle';
+		ctx.fillText('P.S.', x, y);
 	}
 }
 

@@ -10,6 +10,8 @@
 import type { Tab, TabNote, Articulation } from './types';
 import { newNoteId } from '../midi/arrange';
 import { retuneHarmonic } from './harmonics';
+import { barCount, barLengthOf, barStart, normalizeMap, tempoChanges, warpTime } from './tempo';
+import type { TempoChange } from './types';
 
 export { newNoteId };
 
@@ -231,9 +233,7 @@ export function makeEmptyTab(opts: {
 	timeSignature: [number, number];
 	bars: number;
 }): Tab {
-	const [beatsPerBar] = opts.timeSignature;
-	const secondsPerBeat = 60 / opts.bpm;
-	const secondsPerBar = beatsPerBar * secondsPerBeat;
+	const secondsPerBar = barLengthOf(opts.bpm, opts.timeSignature);
 	return {
 		notes: [],
 		bpm: opts.bpm,
@@ -244,21 +244,27 @@ export function makeEmptyTab(opts: {
 	};
 }
 
-// Change the tempo keeping every note on its beat: note times, lengths and
-// timed articulations scale with the bar length, as does the tab's length.
-export function cmdSetTempo(bpm: number): Command {
+// Replace the tempo map, keeping every note in its bar at the same position
+// within it (counted in quarter notes): a tempo change keeps notes on their
+// beats, later sections move along. Note lengths, timed articulations and
+// the tab's length move with them.
+export function cmdSetTempoMap(map: TempoChange[]): Command {
 	let before: {
 		bpm: number;
+		timeSignature: [number, number];
 		secondsPerBar: number;
+		tempoMap: TempoChange[] | undefined;
 		durationSec: number;
 		notes: Map<string, Pick<TabNote, 'time' | 'duration' | 'articulations'>>;
 	} | null = null;
 	return {
-		label: 'Set tempo',
+		label: 'Change tempo',
 		apply(tab) {
 			before = {
 				bpm: tab.bpm,
+				timeSignature: tab.timeSignature,
 				secondsPerBar: tab.secondsPerBar,
+				tempoMap: tab.tempoMap,
 				durationSec: tab.durationSec,
 				notes: new Map(
 					tab.notes.map((n) => [
@@ -267,21 +273,42 @@ export function cmdSetTempo(bpm: number): Command {
 					])
 				)
 			};
-			const k = tab.bpm / bpm;
+			const from = {
+				bpm: tab.bpm,
+				timeSignature: tab.timeSignature,
+				secondsPerBar: tab.secondsPerBar,
+				tempoMap: tempoChanges(tab)
+			};
+			const next = normalizeMap(map);
+			const first = next[0];
+			const to = {
+				bpm: first.bpm,
+				timeSignature: first.timeSignature,
+				secondsPerBar: barLengthOf(first.bpm, first.timeSignature),
+				tempoMap: next
+			};
+			const warp = (t: number) => warpTime(from, to, t);
 			for (const n of tab.notes) {
-				n.time *= k;
-				n.duration *= k;
+				const end = warp(n.time + n.duration);
+				n.time = warp(n.time);
+				n.duration = Math.max(0, end - n.time);
 				n.articulations = n.articulations.map((a) =>
-					a.kind === 'vibrato' ? { ...a, startTime: a.startTime * k, endTime: a.endTime * k } : a
+					a.kind === 'vibrato'
+						? { ...a, startTime: warp(a.startTime), endTime: warp(a.endTime) }
+						: a
 				);
 			}
-			tab.bpm = bpm;
-			tab.secondsPerBar = tab.timeSignature[0] * (60 / bpm);
-			tab.durationSec *= k;
+			// The tab keeps its number of bars.
+			const bars = barCount(from, tab.durationSec);
+			tab.durationSec = barStart(to, bars);
+			tab.bpm = to.bpm;
+			tab.timeSignature = to.timeSignature;
+			tab.secondsPerBar = to.secondsPerBar;
+			tab.tempoMap = next.length > 1 ? next : undefined;
 		},
 		revert(tab) {
 			if (!before) return;
-			// Restore the exact values (no rounding drift from scaling back).
+			// Restore the exact values (no rounding drift from warping back).
 			for (const n of tab.notes) {
 				const b = before.notes.get(n.id);
 				if (!b) continue;
@@ -290,7 +317,9 @@ export function cmdSetTempo(bpm: number): Command {
 				n.articulations = b.articulations;
 			}
 			tab.bpm = before.bpm;
+			tab.timeSignature = before.timeSignature;
 			tab.secondsPerBar = before.secondsPerBar;
+			tab.tempoMap = before.tempoMap;
 			tab.durationSec = before.durationSec;
 		}
 	};
@@ -300,8 +329,7 @@ export function cmdSetTempo(bpm: number): Command {
 // click past the current end). Snaps to whole bars.
 export function extendDurationTo(tab: Tab, atLeastSec: number): Command | null {
 	if (tab.durationSec >= atLeastSec) return null;
-	const bars = Math.ceil(atLeastSec / tab.secondsPerBar);
-	const newDur = bars * tab.secondsPerBar;
+	const newDur = barStart(tab, barCount(tab, atLeastSec));
 	const prev = tab.durationSec;
 	return {
 		label: 'Extend duration',

@@ -1,14 +1,11 @@
 import midiPkg from '@tonejs/midi';
 const { Midi } = midiPkg;
 import type { Tuning } from '../tab/tuning';
-import type { Tab } from '../tab/types';
+import type { Tab, TempoChange } from '../tab/types';
+import { barLengthOf, normalizeMap } from '../tab/tempo';
 import { arrange, DEFAULT_ARRANGE_OPTIONS, type ArrangeOptions, type RawNote } from './arrange';
 import { classifyNote, DEFAULT_THRESHOLDS, type ClassifyThresholds } from './articulate';
-import {
-	DEFAULT_EXTRACT_OPTIONS,
-	extractExpressions,
-	type ExtractOptions
-} from './expressions';
+import { DEFAULT_EXTRACT_OPTIONS, extractExpressions, type ExtractOptions } from './expressions';
 
 export type ParseOptions = ArrangeOptions & {
 	extract: ExtractOptions;
@@ -88,13 +85,53 @@ export function parseMidi(
 	const bpm = midi.header.tempos[0]?.bpm ?? 120;
 	const ts = midi.header.timeSignatures[0]?.timeSignature ?? [4, 4];
 	const timeSignature: [number, number] = [ts[0], ts[1]];
-	const secondsPerBar = (timeSignature[0] * (4 / timeSignature[1]) * 60) / bpm;
+	const secondsPerBar = barLengthOf(bpm, timeSignature);
+	// Tempo / time-signature changes, as bar-based sections. (Not when the
+	// leading silence was cut: bars no longer start where the file's do.)
+	const tempoMap = offset > 0 ? undefined : midiTempoMap(midi, bpm, timeSignature);
 	return {
 		notes,
 		durationSec: maxEnd,
 		bpm,
 		timeSignature,
 		secondsPerBar,
+		tempoMap,
 		trimmedLeadingSec: offset
 	};
+}
+
+// The file's tempo and time-signature changes as sections starting at bars
+// (a change mid-bar is moved to the nearest bar line). Undefined without
+// changes.
+function midiTempoMap(
+	midi: InstanceType<typeof Midi>,
+	bpm: number,
+	timeSignature: [number, number]
+): TempoChange[] | undefined {
+	const ppq = midi.header.ppq || 480;
+	const events = [
+		...midi.header.tempos.map((t) => ({ ticks: t.ticks, bpm: t.bpm })),
+		...midi.header.timeSignatures.map((t) => ({
+			ticks: t.ticks,
+			ts: [t.timeSignature[0], t.timeSignature[1]] as [number, number]
+		}))
+	].sort((a, b) => a.ticks - b.ticks);
+	const map: TempoChange[] = [{ bar: 0, bpm, timeSignature }];
+	let cur = map[0];
+	let startTick = 0;
+	for (const e of events) {
+		const ticksPerBar = cur.timeSignature[0] * ppq * (4 / cur.timeSignature[1]);
+		const bar = cur.bar + Math.max(0, Math.round((e.ticks - startTick) / ticksPerBar));
+		const next: TempoChange = {
+			bar,
+			bpm: 'bpm' in e ? e.bpm : cur.bpm,
+			timeSignature: 'ts' in e ? e.ts : cur.timeSignature
+		};
+		startTick += (bar - cur.bar) * ticksPerBar;
+		if (bar === cur.bar) map[map.length - 1] = next;
+		else map.push(next);
+		cur = next;
+	}
+	const normalized = normalizeMap(map);
+	return normalized.length > 1 ? normalized : undefined;
 }

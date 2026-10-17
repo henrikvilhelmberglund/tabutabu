@@ -7,7 +7,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, promises as fs } from 'node:fs';
+import { createReadStream, existsSync, promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -129,4 +129,53 @@ export async function startSeparation(audio: Uint8Array, ext: string): Promise<s
 		}
 	});
 	return id;
+}
+
+// ---- Export ---------------------------------------------------------------
+// Every stem as a 24-bit WAV (from the lossless FLAC copy; splits made before
+// that existed fall back to the Opus copy), zipped. All stems start where the
+// original file does, so they line up in a DAW.
+
+export type StemExport = { zip: NodeJS.ReadableStream; lossless: boolean; cleanup: () => void };
+
+function toWav(src: string, dst: string): Promise<void> {
+	return new Promise((done, fail) => {
+		const p = spawn('ffmpeg', ['-v', 'error', '-y', '-i', src, '-c:a', 'pcm_s24le', dst], {
+			stdio: ['ignore', 'ignore', 'pipe']
+		});
+		let err = '';
+		p.stderr.on('data', (d: Buffer) => (err += d));
+		p.on('error', fail);
+		p.on('close', (code) =>
+			code === 0 ? done() : fail(new Error(err.trim() || `ffmpeg ${code}`))
+		);
+	});
+}
+
+export async function exportStems(id: string, songName: string): Promise<StemExport | null> {
+	if (getJob(id)?.status !== 'done') return null;
+	const { default: JSZip } = await import('jszip');
+	const out = await fs.mkdtemp(join(tmpdir(), 'tabutabu-export-'));
+	const cleanup = () => void fs.rm(out, { recursive: true, force: true });
+	try {
+		let lossless = true;
+		const zip = new JSZip();
+		for (const stem of STEMS) {
+			const flac = join(dirOf(id), `${stem}.flac`);
+			const src = existsSync(flac) ? flac : stemPath(id, stem);
+			if (src !== flac) lossless = false;
+			const wav = join(out, `${stem}.wav`);
+			await toWav(src, wav);
+			// Read while zipping, not all at once (a long song's stems are
+			// hundreds of MB as WAV).
+			zip.file(`${songName} - ${stem}.wav`, createReadStream(wav));
+		}
+		const stream = zip.generateNodeStream({ streamFiles: true, compression: 'STORE' });
+		stream.on('end', cleanup);
+		stream.on('error', cleanup);
+		return { zip: stream, lossless, cleanup };
+	} catch (e) {
+		cleanup();
+		throw e;
+	}
 }

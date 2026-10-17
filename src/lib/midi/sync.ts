@@ -37,6 +37,10 @@ export class DawSync {
 		this.secondsPer16thNote = 60 / (bpm * 4);
 	}
 
+	// Song position (in 16th notes) → seconds, when the song changes tempo /
+	// time signature (else the single tempo above is used).
+	positionToSeconds: ((sixteenths: number) => number) | null = null;
+
 	async listPorts(): Promise<SyncPortInfo[]> {
 		this.access ??= await navigator.requestMIDIAccess({ sysex: false });
 		return Array.from(this.access.inputs.values()).map((p) => ({
@@ -91,7 +95,9 @@ export class DawSync {
 				break;
 			case 0xf2: {
 				const spp = (data[1] ?? 0) | ((data[2] ?? 0) << 7);
-				const pos = spp * this.secondsPer16thNote;
+				const pos = this.positionToSeconds
+					? this.positionToSeconds(spp)
+					: spp * this.secondsPer16thNote;
 				this.lastSppReceivedMs = performance.now();
 				if (this.debug) console.log(`[sync] SPP → ${pos.toFixed(3)}s (spp=${spp})`);
 				this.callbacks.onSeek(pos);

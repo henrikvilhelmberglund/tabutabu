@@ -9,6 +9,7 @@
 //   - The consumer polls `currentSongTime()` to sync a visual playhead.
 
 import type { Articulation, Tab, TabNote } from '../tab/types';
+import { barAt, barInfo } from '../tab/tempo';
 
 export type SynthOptions = {
 	masterVolume: number; // 0..1
@@ -29,6 +30,8 @@ export const DEFAULT_SYNTH_OPTIONS: SynthOptions = {
 type Voice = {
 	osc: OscillatorNode;
 	gain: GainNode;
+	// Pick slide's noise source.
+	noise?: AudioBufferSourceNode;
 	lfo?: OscillatorNode;
 	lfoGain?: GainNode;
 	endsAtCtxTime: number;
@@ -89,6 +92,13 @@ export class Synth {
 	 * bar/beat playback so we don't queue up notes that would fire outside
 	 * the focus window and then get cut mid-attack by the rAF stop check.
 	 */
+	// How long playback runs (song seconds) — can be past the tab's own end
+	// (e.g. a longer reference); the metronome keeps clicking until then.
+	private playbackEnd = 0;
+	setPlaybackEnd(seconds: number): void {
+		this.playbackEnd = seconds;
+	}
+
 	play(tab: Tab, fromSongTime: number, toSongTime?: number): void {
 		const { ctx, master } = this.ensureCtx();
 		if (ctx.state === 'suspended') void ctx.resume();
@@ -124,6 +134,10 @@ export class Synth {
 				(a) => a.kind === 'hammerOn' || a.kind === 'pullOff' || a.kind === 'tap'
 			) ?? false;
 		const nextGlobalAfter = new Map<string, number>();
+		// Next note WITHOUT let ring (any string): it stops a let-ring note.
+		const nextPlainAfter = new Map<string, number>();
+		const isLetRingNote = (n: TabNote) =>
+			n.articulations?.some((a) => a.kind === 'letRing') ?? false;
 		const nextOnStringAfter = new Map<string, number>();
 		const seenNextByString = new Map<number, number>();
 		// Walk backwards; for each note find the earliest STRICTLY-later note.
@@ -143,6 +157,15 @@ export class Synth {
 					break;
 				}
 			}
+			if (isLetRingNote(n)) {
+				for (let j = i + 1; j < tab.notes.length; j++) {
+					const m = tab.notes[j];
+					if (m.time > n.time + EPS && !isLetRingNote(m)) {
+						nextPlainAfter.set(n.id, m.time);
+						break;
+					}
+				}
+			}
 		}
 
 		// How many notes start together with each note (a chord), for
@@ -156,17 +179,20 @@ export class Synth {
 		}
 
 		for (const n of tab.notes) {
-			// Skip notes that started BEFORE the playback window — otherwise
-			// their attack fires immediately at t=0 and you hear the pluck
-			// of a previous-bar note leak into the new one.
-			if (n.time < fromSongTime - 1e-6) continue;
+			// Notes that started BEFORE the playback window are skipped —
+			// otherwise their attack fires immediately at t=0 and you hear
+			// the pluck of a previous-bar note leak into the new one. Except
+			// let-ring notes still ringing then: those join in, already
+			// sounding (see below).
+			const isLetRing = n.articulations?.some((a) => a.kind === 'letRing');
+			const before = n.time < fromSongTime - 1e-6;
+			if (before && !isLetRing) continue;
 			// Skip notes that would start AT or AFTER the playback stop
 			// (author-mode bar/beat scoping). Without this, a note at the
 			// very start of the next bar fires and gets cancelled 10-20 ms
 			// later by the rAF stop check, producing a brief audible pluck.
 			if (toSongTime !== undefined && n.time >= toSongTime - 1e-6) continue;
 			const noteCtxStart = ctxStart + Math.max(0, n.time - fromSongTime);
-			const isLetRing = n.articulations?.some((a) => a.kind === 'letRing');
 			// Cap logic — ignores the note's declared duration on purpose;
 			// the user's mental model is "ring until something else
 			// happens":
@@ -175,19 +201,53 @@ export class Synth {
 			//     note on the same string, or the bar end — whichever
 			//     comes first.
 			//   Let-ring notes:
-			//     ring until the next same-string note, or a natural
-			//     string-decay cap (~5 s) if nothing follows.
+			//     ring until the next same-string note, the next note
+			//     without let ring (any string), or a natural string-decay
+			//     cap (~5 s) — whichever comes first.
 			let rawEndSong: number;
-			if (isLetRing) {
-				const nextSame = nextOnStringAfter.get(n.id);
-				rawEndSong = nextSame !== undefined ? nextSame : n.time + 5;
+			const bar = barAt(tab, n.time + 1e-6);
+			const barEnd = bar.start + bar.length;
+			if (n.articulations?.some((a) => a.kind === 'pickSlide')) {
+				// A pick slide scrapes on to the end of its bar.
+				rawEndSong = barEnd;
+			} else if (isLetRing) {
+				// Rings until the string is played again, or a note without
+				// let ring is played on any string (that's how a let ring is
+				// stopped), or the natural ~5 s decay.
+				rawEndSong = Math.min(
+					nextOnStringAfter.get(n.id) ?? Infinity,
+					nextPlainAfter.get(n.id) ?? Infinity,
+					n.time + 5
+				);
 			} else {
-				const barEnd = Math.ceil((n.time + 1e-6) / tab.secondsPerBar) * tab.secondsPerBar;
 				const nextGlobal = nextGlobalAfter.get(n.id) ?? Infinity;
 				const nextSame = nextOnStringAfter.get(n.id) ?? Infinity;
 				rawEndSong = Math.min(nextGlobal, nextSame, barEnd);
 			}
 			const noteCtxEnd = ctxStart + (rawEndSong - fromSongTime);
+			if (before) {
+				// A let ring from before the window, still ringing: it fades in
+				// at the start (no fresh pluck) and rings on by the same rules.
+				// Slides into it already happened, so they're left out.
+				if (rawEndSong <= fromSongTime + 0.05) continue;
+				if (n.articulations.some((a) => a.kind === 'pickSlide')) continue;
+				const ringing: TabNote = {
+					...n,
+					articulations: n.articulations.filter(
+						(a) => a.kind !== 'slideUp' && a.kind !== 'slideDown' && a.kind !== 'graceSlide'
+					)
+				};
+				this.scheduleVoice(
+					ctx,
+					master,
+					ringing,
+					ctxStart,
+					noteCtxEnd,
+					chordLevel(chordSize.get(n.id) ?? 1),
+					true
+				);
+				continue;
+			}
 			this.scheduleVoice(
 				ctx,
 				master,
@@ -211,22 +271,21 @@ export class Synth {
 		ctxStart: number,
 		toSongTime?: number
 	): void {
-		const beatsPerBar = tab.timeSignature[0];
-		if (beatsPerBar <= 0) return;
-		const secondsPerBeat = tab.secondsPerBar / beatsPerBar;
-		if (secondsPerBeat <= 0) return;
-
-		const firstBeatIndex = Math.max(0, Math.ceil(fromSongTime / secondsPerBeat - 1e-6));
-		const endSong = toSongTime ?? tab.durationSec;
-		const lastBeatIndex = Math.floor(endSong / secondsPerBeat);
-		for (let i = firstBeatIndex; i <= lastBeatIndex; i++) {
-			const songT = i * secondsPerBeat;
-			if (songT < fromSongTime) continue;
-			// Don't click the downbeat of the NEXT bar at the end of a
-			// bar/beat preview.
-			if (toSongTime !== undefined && songT >= toSongTime - 1e-6) break;
-			const ctxT = ctxStart + (songT - fromSongTime);
-			this.scheduleClick(ctx, master, ctxT, i % beatsPerBar === 0);
+		const endSong = toSongTime ?? Math.max(tab.durationSec, this.playbackEnd);
+		// Every beat of every bar (bars may differ in tempo / time signature).
+		for (let b = barAt(tab, fromSongTime).index; ; b++) {
+			const bar = barInfo(tab, b);
+			if (bar.start > endSong + 1e-6 || bar.beatLength <= 0) break;
+			for (let i = 0; i < bar.beats; i++) {
+				const songT = bar.start + i * bar.beatLength;
+				if (songT < fromSongTime - 1e-6) continue;
+				if (songT > endSong + 1e-6) break;
+				// Don't click the downbeat of the NEXT bar at the end of a
+				// bar/beat preview.
+				if (toSongTime !== undefined && songT >= toSongTime - 1e-6) break;
+				const ctxT = ctxStart + (songT - fromSongTime);
+				this.scheduleClick(ctx, master, ctxT, i === 0);
+			}
 		}
 	}
 
@@ -301,6 +360,7 @@ export class Synth {
 				v.gain.gain.linearRampToValueAtTime(0, now + 0.02);
 				v.osc.stop(now + 0.03);
 				v.lfo?.stop(now + 0.03);
+				v.noise?.stop(now + 0.03);
 			} catch {
 				// osc may already be stopped; ignore
 			}
@@ -322,6 +382,7 @@ export class Synth {
 				v.gain.gain.linearRampToValueAtTime(0, now + 0.02);
 				v.osc.stop(now + 0.03);
 				v.lfo?.stop(now + 0.03);
+				v.noise?.stop(now + 0.03);
 			} catch {
 				// osc may already be stopped; ignore
 			}
@@ -351,10 +412,16 @@ export class Synth {
 		endCtxTime: number,
 		// Level multiplier (chordLevel) so chords stay about as loud as
 		// single notes.
-		level = 1
+		level = 1,
+		// Already sounding (a let ring carried into the playback window):
+		// fade in instead of a plucked attack.
+		fadeIn = false
 	): Voice {
 		const arts = note.articulations ?? [];
 		const has = (kind: Articulation['kind']) => arts.some((a) => a.kind === kind);
+		if (has('pickSlide')) {
+			return this.schedulePickSlide(ctx, master, note, startCtxTime, endCtxTime, level);
+		}
 
 		// Harmonic sounds one octave (or 12+N semitones) above the fretted note.
 		const harmonic = arts.find((a) => a.kind === 'harmonic');
@@ -376,7 +443,7 @@ export class Synth {
 		this.schedulePitchCurve(osc, arts, startCtxTime, endCtxTime);
 
 		const gain = ctx.createGain();
-		this.scheduleAmplitudeEnvelope(gain, note, arts, startCtxTime, endCtxTime, level);
+		this.scheduleAmplitudeEnvelope(gain, note, arts, startCtxTime, endCtxTime, level, fadeIn);
 
 		if (palmMute) {
 			// Palm mute = damped strings: a low-pass that opens briefly on
@@ -415,6 +482,67 @@ export class Synth {
 		const voice: Voice = { osc, gain, lfo, lfoGain, endsAtCtxTime: endCtxTime };
 		this.voices.push(voice);
 		return voice;
+	}
+
+	// Pick slide: the pick scraped down the wound strings — a noisy, buzzing
+	// "zzzeeoww" falling about two octaves from around the note, instead of a
+	// picked note, over the whole time it's given (to the end of its bar in
+	// playback).
+	private schedulePickSlide(
+		ctx: AudioContext,
+		master: GainNode,
+		note: TabNote,
+		start: number,
+		end: number,
+		level: number
+	): Voice {
+		const stop = start + Math.max(0.12, end - start);
+		const f0 = midiToFreq(note.midi);
+		// Noise through a resonant band-pass sweeping down.
+		const noise = ctx.createBufferSource();
+		noise.buffer = this.noiseBuffer(ctx);
+		noise.loop = true;
+		const band = ctx.createBiquadFilter();
+		band.type = 'bandpass';
+		band.Q.value = 6;
+		band.frequency.setValueAtTime(Math.min(f0 * 6, 5000), start);
+		band.frequency.exponentialRampToValueAtTime(Math.max(f0 * 1.5, 120), stop);
+		// A buzzy tone falling alongside gives it the pitched sweep.
+		const osc = ctx.createOscillator();
+		osc.type = 'sawtooth';
+		osc.frequency.setValueAtTime(f0 * 2, start);
+		osc.frequency.exponentialRampToValueAtTime(f0 * 0.5, stop);
+		const buzz = ctx.createGain();
+		buzz.gain.value = 0.3;
+		const gain = ctx.createGain();
+		const peak = 0.6 * note.velocity * level;
+		gain.gain.setValueAtTime(0, start);
+		gain.gain.linearRampToValueAtTime(peak, start + 0.01);
+		gain.gain.exponentialRampToValueAtTime(peak * 0.08, stop - 0.02);
+		gain.gain.linearRampToValueAtTime(0, stop);
+		noise.connect(band);
+		osc.connect(buzz);
+		buzz.connect(band);
+		band.connect(gain);
+		gain.connect(master);
+		noise.start(start);
+		noise.stop(stop + 0.05);
+		osc.start(start);
+		osc.stop(stop + 0.05);
+		const voice: Voice = { osc, gain, noise, endsAtCtxTime: stop };
+		this.voices.push(voice);
+		return voice;
+	}
+
+	// One second of white noise, made once per audio context.
+	private noiseCache: { ctx: BaseAudioContext; buffer: AudioBuffer } | null = null;
+	private noiseBuffer(ctx: BaseAudioContext): AudioBuffer {
+		if (this.noiseCache?.ctx === ctx) return this.noiseCache.buffer;
+		const buffer = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+		const d = buffer.getChannelData(0);
+		for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+		this.noiseCache = { ctx, buffer };
+		return buffer;
 	}
 
 	private schedulePitchCurve(
@@ -468,7 +596,8 @@ export class Synth {
 		arts: Articulation[],
 		start: number,
 		end: number,
-		level = 1
+		level = 1,
+		fadeIn = false
 	): void {
 		const ghost = arts.some((a) => a.kind === 'ghost');
 		const palmMute = arts.some((a) => a.kind === 'palmMute');
@@ -476,7 +605,7 @@ export class Synth {
 		const dur = Math.max(0.05, end - start);
 		// Snappy onset — 2 ms is short enough to feel plucked but avoids the DC
 		// pop you'd get from a hard step.
-		const attack = Math.min(0.002, dur * 0.4);
+		const attack = Math.min(fadeIn ? FADE_IN : 0.002, dur * 0.4);
 
 		if (palmMute) {
 			// Palm mute: a rounded, plateau-shaped envelope. Softer 5 ms
@@ -485,7 +614,7 @@ export class Synth {
 			// short release at note-off. This keeps palm-muted notes
 			// audibly loud (they were sounding much quieter than the
 			// sustained notes) while still reading as damped and percussive.
-			const pmAttack = Math.min(0.005, dur * 0.3);
+			const pmAttack = Math.min(fadeIn ? FADE_IN : 0.005, dur * 0.3);
 			const pmDecayDur = 0.06;
 			const peak = 0.42 * note.velocity * level;
 			const sustain = peak * 0.75;
@@ -520,6 +649,9 @@ const CHORD_LEVEL_EXPONENT = 0.35;
 function chordLevel(n: number): number {
 	return Math.pow(Math.max(1, n), -CHORD_LEVEL_EXPONENT);
 }
+
+// Fade-in for a let ring that's already sounding when playback starts.
+const FADE_IN = 0.04;
 
 function midiToFreq(midi: number): number {
 	return 440 * Math.pow(2, (midi - 69) / 12);

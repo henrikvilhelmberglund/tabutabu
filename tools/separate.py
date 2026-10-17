@@ -7,7 +7,8 @@ torch sees one, otherwise the CPU (much slower).
 
 Usage: python separate.py <input audio> <output dir> [model]
 
-Writes <output dir>/<stem>.ogg (Opus) for every stem. Prints lines the
+Writes <output dir>/<stem>.ogg (Opus, for the app) and <stem>.flac
+(lossless 24-bit, for exporting) for every stem. Prints lines the
 server reads:
     PROGRESS <0..1>
     DEVICE <cuda|cpu>
@@ -40,15 +41,21 @@ def decode(path: str) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2).T.copy()
 
 
-def encode(samples: np.ndarray, path: Path):
-    """float32 (2, samples) -> Opus file."""
+def encode(samples: np.ndarray, path: Path, codec: list[str]):
+    """float32 (2, samples) -> audio file with the given ffmpeg codec args."""
     data = np.ascontiguousarray(samples.T, dtype=np.float32).tobytes()
     subprocess.run(
         ["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ac", "2", "-ar", str(SAMPLE_RATE), "-i", "-",
-         "-c:a", "libopus", "-b:a", "192k", str(path)],
+         *codec, str(path)],
         input=data,
         check=True,
     )
+
+
+# Compressed copy the app plays and analyses, and a lossless 24-bit one for
+# exporting to a DAW.
+OPUS = ["-c:a", "libopus", "-b:a", "192k"]
+FLAC = ["-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
 
 
 class Progress:
@@ -89,7 +96,9 @@ def main():
     sources = sources * std + mean
 
     for name, audio in zip(model.sources, sources):
-        encode(audio.cpu().numpy(), out_dir / f"{name}.ogg")
+        samples = audio.cpu().numpy()
+        encode(samples, out_dir / f"{name}.flac", FLAC)
+        encode(samples, out_dir / f"{name}.ogg", OPUS)
     say("DONE")
 
 
