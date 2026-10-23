@@ -88,10 +88,20 @@ export function getJob(id: string): Job | null {
 	return isDone(id) ? { status: 'done', progress: 1 } : null;
 }
 
+// A stretch of the song to separate, in seconds (the stems are silent
+// outside it but as long as the song).
+export type SplitRange = { start: number; length: number };
+
 // Start separating `audio` (unless it's cached or already running). Returns
-// the job id: the file's content hash.
-export async function startSeparation(audio: Uint8Array, ext: string): Promise<string> {
-	const id = createHash('sha1').update(audio).digest('hex').slice(0, 20);
+// the job id: the file's content hash (plus the stretch, if any).
+export async function startSeparation(
+	audio: Uint8Array,
+	ext: string,
+	range?: SplitRange
+): Promise<string> {
+	const hash = createHash('sha1').update(audio);
+	if (range) hash.update(`:${range.start}:${range.length}`);
+	const id = hash.digest('hex').slice(0, 20);
 	const running = jobs.get(id);
 	if (isDone(id) || running?.status === 'running') return id;
 
@@ -102,7 +112,12 @@ export async function startSeparation(audio: Uint8Array, ext: string): Promise<s
 
 	const job: Job = { status: 'running', progress: 0 };
 	jobs.set(id, job);
-	const p = spawn(PYTHON, [SCRIPT, input, dir], { stdio: ['ignore', 'pipe', 'pipe'] });
+	const rangeArgs = range
+		? ['--start', String(range.start), '--length', String(range.length)]
+		: [];
+	const p = spawn(PYTHON, [SCRIPT, input, dir, ...rangeArgs], {
+		stdio: ['ignore', 'pipe', 'pipe']
+	});
 	let err = '';
 	p.stdout.on('data', (d: Buffer) => {
 		for (const line of d.toString().split(/\r?\n/)) {

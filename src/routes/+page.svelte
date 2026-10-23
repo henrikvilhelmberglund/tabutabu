@@ -2,6 +2,14 @@
 	import { onMount, untrack } from 'svelte';
 	import { parseMidi } from '$lib/midi/parse';
 	import { parseDawproject } from '$lib/dawproject/parse';
+	import {
+		defaultGpTrack,
+		GP_FILE_PATTERN,
+		gpTrackToTab,
+		readGuitarPro,
+		type GpSong,
+		type GpTrack
+	} from '$lib/gp/parse';
 	import { inspectMidi, type MidiInspection } from '$lib/midi/expressions';
 	import {
 		renderTabFrame,
@@ -14,7 +22,13 @@
 		type PlayheadStyle,
 		type Theme
 	} from '$lib/tab/renderer';
-	import { TUNINGS, STRING_COUNT, MAX_FRET } from '$lib/tab/tuning';
+	import {
+		TUNINGS,
+		STRING_COUNT,
+		MAX_FRET,
+		resolveTuning,
+		tuningKeyFor
+	} from '$lib/tab/tuning';
 	import type { Tab, TabNote, Articulation } from '$lib/tab/types';
 	import {
 		NATURAL_HARMONIC_OFFSET,
@@ -44,6 +58,8 @@
 	} from '$lib/tab/chords';
 	import { PitchProbe } from '$lib/audio/probe';
 	import { findSongStart } from '$lib/audio/beat-align';
+	import { needsSeekableCopy, seekableCopy } from '$lib/audio/seekable';
+	import { tabToAscii } from '$lib/tab/ascii';
 	import { metronomeBarMidi, tabToMidi } from '$lib/midi/export';
 	import {
 		barAt,
@@ -245,6 +261,31 @@
 	// at. beatIdx=0 means "whole bar"; beatIdx 1..timeSig[0] means that
 	// specific beat.
 	let authorFocus = $state<{ barIdx: number; beatIdx: number }>({ barIdx: 0, beatIdx: 0 });
+	// Shift+↑/↓ selects bars from here to the focused bar (null: just the
+	// focused one). Any other focus move drops it.
+	let barSelectAnchor = $state<number | null>(null);
+	let extendingBarSelection = false;
+	$effect(() => {
+		void authorFocus;
+		untrack(() => {
+			if (!extendingBarSelection) barSelectAnchor = null;
+			extendingBarSelection = false;
+		});
+	});
+	// First and last selected bar.
+	function selectedBarRange(): [number, number] {
+		const f = authorFocus.barIdx;
+		const a = barSelectAnchor ?? f;
+		return [Math.min(a, f), Math.max(a, f)];
+	}
+	// A short confirmation shown over the page (e.g. "Copied").
+	let notice = $state<string | null>(null);
+	let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+	function showNotice(text: string) {
+		notice = text;
+		if (noticeTimer) clearTimeout(noticeTimer);
+		noticeTimer = setTimeout(() => (notice = null), 1800);
+	}
 
 	// Author-mode pointer state. Set on pointerdown, updated on pointermove,
 	// committed on pointerup.
@@ -411,6 +452,51 @@
 	// Kept out of $state so buffer identity doesn't drive reactivity.
 	let midiBuffer: ArrayBuffer | null = null;
 	let isDawprojectFile = false;
+	let isGpFile = false;
+	// An open Guitar Pro file (read once; re-converted when the track or
+	// tuning changes) and its tracks for the track picker.
+	let gpSong: GpSong | null = null;
+	let gpTracks = $state.raw<GpTrack[]>([]);
+	let gpTrack = $state<number | null>(null);
+	// Tunings can be added at run time (a Guitar Pro file's own tuning).
+	let tuningsVersion = $state(0);
+	const tuningList = $derived.by(() => {
+		void tuningsVersion;
+		return Object.entries(TUNINGS);
+	});
+	// Selects a tuning by key, adding a custom one ("custom:…") if needed.
+	function useTuningKey(key: string): boolean {
+		if (!resolveTuning(key)) return false;
+		tuningsVersion++;
+		tuningKey = key;
+		return true;
+	}
+	// Remembered track choice per Guitar Pro file name.
+	function savedGpTrack(name: string): number | null {
+		try {
+			const all = JSON.parse(localStorage.getItem('tabutabu.gpTracks') ?? '{}');
+			return typeof all[name] === 'number' ? all[name] : null;
+		} catch {
+			return null;
+		}
+	}
+	function saveGpTrack(name: string, index: number) {
+		try {
+			const all = JSON.parse(localStorage.getItem('tabutabu.gpTracks') ?? '{}');
+			all[name] = index;
+			localStorage.setItem('tabutabu.gpTracks', JSON.stringify(all));
+		} catch {
+			// ignore
+		}
+	}
+	// Show another track of the open Guitar Pro file (in its own tuning).
+	function selectGpTrack(index: number) {
+		const t = gpTracks[index];
+		if (!gpSong || !t || t.unsupported) return;
+		gpTrack = index;
+		if (fileName) saveGpTrack(fileName, index);
+		useTuningKey(tuningKeyFor(t.openNotes, t.tuningName));
+	}
 	// Non-reactive gate: when true, per-file persistence effects skip writing to
 	// IndexedDB. Used while loading a file so the initial empty state isn't
 	// saved on top of the file's actual persisted overrides/annotations.
@@ -512,7 +598,14 @@
 		status: 'running' | 'done' | 'error';
 		progress: number;
 		error?: string;
+		// Only this stretch was split (seconds in the reference).
+		range?: SplitRange;
 	} | null>(null);
+	type SplitRange = { start: number; length: number };
+	// How much to split: 0 = the whole song, else this many seconds from
+	// the offset (where the tab starts). Persisted.
+	let splitSpan = $state(0);
+	const SPLIT_SPANS = [0, 60, 120, 180, 300];
 	const stemBuffers = new Map<string, ArrayBuffer>();
 	// The source actually shown (a stem only once the split is done).
 	let effectiveSource = $derived<SpectroSource>(
@@ -532,9 +625,12 @@
 		effectiveSource === 'sides' ? 'sides' : listenChannel === 'both' ? 'mix' : listenChannel
 	);
 	// A different source or channel needs a different analysis.
+	// The split's id while a stem is shown: a new split needs a new analysis.
+	const shownStemsId = $derived(isStem(effectiveSource) ? (stems?.id ?? null) : null);
 	$effect(() => {
 		void effectiveSource;
 		void analysisChannel;
+		void shownStemsId;
 		untrack(() => {
 			spectroJob++;
 			spectrogram = null;
@@ -548,6 +644,7 @@
 	// The loaded reference file, kept for analysis (not reactive: it's big),
 	// and what identifies it for the stored analysis.
 	let referenceBuffer: ArrayBuffer | null = null;
+	let referenceType = '';
 	let referenceKey = '';
 	let spectroJob = 0;
 
@@ -575,6 +672,8 @@
 
 	function setReferenceAudio(buffer: ArrayBuffer | null, type = '', name = '', restoring = false) {
 		referenceBuffer = buffer;
+		referenceType = type;
+		if (buffer && needsSeekableCopy(type, name)) void playSeekableCopy(buffer);
 		referenceKey = buffer ? `${name}|${buffer.byteLength}` : '';
 		if (buffer) {
 			const own = savedOffsets()[referenceKey];
@@ -594,6 +693,23 @@
 		stemBuffers.clear();
 		dropStemAudio();
 		if (buffer) void restoreStems(referenceKey);
+	}
+
+	// An MP3 reference plays from an exactly seekable copy (see seekable.ts):
+	// the browser lands seconds off when seeking in a long MP3, while the
+	// spectrogram and stems are exact. Swapped in once it's decoded; the
+	// per-frame sync then puts it at the right time.
+	async function playSeekableCopy(buffer: ArrayBuffer) {
+		try {
+			const copy = await seekableCopy(buffer);
+			if (referenceBuffer !== buffer || !videoUrl) return;
+			const old = videoUrl;
+			videoUrl = URL.createObjectURL(copy);
+			lastVideoPlayCommand = null;
+			URL.revokeObjectURL(old);
+		} catch {
+			// can't decode here — the file plays as it is
+		}
 	}
 
 	$effect(() => {
@@ -628,6 +744,8 @@
 	): Promise<Spectrogram> {
 		const side = channel === 'left' || channel === 'right' ? `:${channel}` : '';
 		const store = `lastSpectrogram:${source}${side}`;
+		// A stem's analysis belongs to that split (another stretch differs).
+		if (isStem(source)) key = `${key}:${stems?.id ?? ''}`;
 		try {
 			const saved = (await idbGet(store)) as (SpectrogramData & { key: string }) | undefined;
 			if (saved?.key === key && saved.version === SPECTROGRAM_VERSION) {
@@ -666,7 +784,7 @@
 
 	// A split done earlier for this reference (the server keeps it).
 	async function restoreStems(key: string) {
-		let saved: { key: string; id: string } | null = null;
+		let saved: { key: string; id: string; range?: SplitRange } | null = null;
 		try {
 			saved = JSON.parse(localStorage.getItem(STEMS_KEY) ?? 'null');
 		} catch {
@@ -677,8 +795,9 @@
 			const res = await fetch(`/api/separate/${saved.id}`);
 			if (!res.ok || key !== referenceKey) return;
 			const job = await res.json();
-			if (job.status === 'done') stems = { id: saved.id, status: 'done', progress: 1 };
-			else if (job.status === 'running') void followStems(key, saved.id);
+			if (job.status === 'done')
+				stems = { id: saved.id, status: 'done', progress: 1, range: saved.range };
+			else if (job.status === 'running') void followStems(key, saved.id, saved.range);
 		} catch {
 			// server without separation
 		}
@@ -688,10 +807,20 @@
 		const buffer = referenceBuffer;
 		const key = referenceKey;
 		if (!buffer || stems?.status === 'running') return;
-		stems = { id: '', status: 'running', progress: 0 };
+		// A stretch from the offset (where the tab starts), or the whole song.
+		const range: SplitRange | undefined =
+			splitSpan > 0
+				? { start: +Math.max(0, videoOffsetSec).toFixed(3), length: splitSpan }
+				: undefined;
+		stems = { id: '', status: 'running', progress: 0, range };
 		try {
 			const ext = (videoFileName ?? '').split('.').pop() ?? '';
-			const res = await fetch(`/api/separate?ext=${encodeURIComponent(ext)}`, {
+			const params = new URLSearchParams({ ext });
+			if (range) {
+				params.set('start', String(range.start));
+				params.set('length', String(range.length));
+			}
+			const res = await fetch(`/api/separate?${params}`, {
 				method: 'POST',
 				// Without a type the dev server reads the body as empty.
 				headers: { 'content-type': 'application/octet-stream' },
@@ -701,34 +830,59 @@
 			if (!res.ok) throw new Error(body.error ?? `status ${res.status}`);
 			if (key !== referenceKey) return;
 			try {
-				localStorage.setItem(STEMS_KEY, JSON.stringify({ key, id: body.id }));
+				localStorage.setItem(STEMS_KEY, JSON.stringify({ key, id: body.id, range }));
 			} catch {
 				// not remembered — can split again
 			}
-			await followStems(key, body.id);
+			await followStems(key, body.id, range);
 		} catch (err) {
 			if (key === referenceKey) {
 				stems = {
 					id: '',
 					status: 'error',
 					progress: 0,
-					error: err instanceof Error ? err.message : String(err)
+					error: err instanceof Error ? err.message : String(err),
+					range
 				};
 			}
 		}
 	}
 
+	// Forget the split (the server keeps it cached) to split again — another
+	// stretch, or the whole song.
+	function splitAgain() {
+		stems = null;
+		dropStemAudio();
+		try {
+			localStorage.removeItem(STEMS_KEY);
+		} catch {
+			// ignore
+		}
+	}
+
+	// "1:05–3:05" for a split stretch.
+	function rangeLabel(r: SplitRange): string {
+		const t = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+		return `${t(r.start)}–${t(r.start + r.length)}`;
+	}
+
 	// Poll a running split until it's done; then show the guitar.
-	async function followStems(key: string, id: string) {
+	async function followStems(key: string, id: string, range?: SplitRange) {
 		for (;;) {
 			const res = await fetch(`/api/separate/${id}`);
 			const job = await res.json();
 			if (key !== referenceKey) return;
 			if (!res.ok || job.status === 'error') {
-				stems = { id, status: 'error', progress: 0, error: job.error ?? `status ${res.status}` };
+				stems = {
+					id,
+					status: 'error',
+					progress: 0,
+					error: job.error ?? `status ${res.status}`,
+					range
+				};
 				return;
 			}
-			stems = { id, status: job.status, progress: job.progress ?? 0 };
+			stems = { id, status: job.status, progress: job.progress ?? 0, range };
 			if (job.status === 'done') {
 				spectroChannel = 'guitar';
 				return;
@@ -1154,6 +1308,11 @@
 		fileName = name;
 		try {
 			midiBuffer = buffer;
+			// Known before the awaits below, so the re-parse effect never reads
+			// this file as MIDI meanwhile.
+			isDawprojectFile = /\.dawproject$/i.test(name);
+			isGpFile = GP_FILE_PATTERN.test(name);
+			gpSong = null;
 			// Load per-file overrides + annotations before parsing so the first
 			// render applies them.
 			try {
@@ -1172,7 +1331,29 @@
 			suppressPerFilePersist = false;
 			const isDawproject = /\.dawproject$/i.test(name);
 			const opts = { honorChannelStrings, keepLeadingSilence, overrides, annotations };
-			if (isDawproject) {
+			gpTracks = [];
+			gpTrack = null;
+			if (isGpFile) {
+				inspection = null;
+				const song = await readGuitarPro(midiBuffer);
+				const saved = savedGpTrack(name);
+				const index =
+					saved !== null && song.tracks[saved] && !song.tracks[saved].unsupported
+						? saved
+						: defaultGpTrack(song);
+				if (index === null)
+					throw new Error(
+						`No 6-string guitar track in this file (${song.tracks
+							.map((t) => `${t.name}: ${t.unsupported ?? 'ok'}`)
+							.join(', ')})`
+					);
+				const track = song.tracks[index];
+				useTuningKey(tuningKeyFor(track.openNotes, track.tuningName));
+				tab = gpTrackToTab(song, index, TUNINGS[tuningKey].openNotes);
+				gpSong = song;
+				gpTracks = song.tracks;
+				gpTrack = index;
+			} else if (isDawproject) {
 				inspection = null;
 				tab = await parseDawproject(midiBuffer, TUNINGS[tuningKey], opts);
 			} else {
@@ -1192,6 +1373,9 @@
 			parseError = err instanceof Error ? err.message : String(err);
 			tab = null;
 			midiBuffer = null;
+			gpSong = null;
+			gpTracks = [];
+			gpTrack = null;
 		} finally {
 			suppressPerFilePersist = false;
 		}
@@ -1570,7 +1754,10 @@
 		// Grab the source video bytes so we can send it with the config.
 		let videoBlob: Blob | null = null;
 		try {
-			videoBlob = await (await fetch(videoUrl)).blob();
+			// The file as loaded (an MP3 reference plays from a WAV copy).
+			videoBlob = referenceBuffer
+				? new Blob([referenceBuffer], { type: referenceType })
+				: await (await fetch(videoUrl)).blob();
 		} catch (err) {
 			exportError =
 				'Could not read source video: ' + (err instanceof Error ? err.message : String(err));
@@ -1822,10 +2009,22 @@
 	$effect(() => {
 		const t = TUNINGS[tuningKey];
 		const opts = { honorChannelStrings, keepLeadingSilence, overrides, annotations };
+		const track = gpTrack;
 		if (!midiBuffer) return;
 		// Authored tabs are detached from any source file (see
 		// detachFromSourceFile); never re-parse over them.
 		if (untrack(() => mode) === 'author') return;
+		// Guitar Pro: the chosen track, frets as written, pitched by the
+		// selected tuning (set to the track's own when it's opened).
+		if (isGpFile) {
+			if (!gpSong || track === null) return;
+			try {
+				tab = gpTrackToTab(gpSong, track, t.openNotes);
+			} catch (err) {
+				parseError = err instanceof Error ? err.message : String(err);
+			}
+			return;
+		}
 		const run = async () => {
 			try {
 				tab = isDawprojectFile
@@ -1859,6 +2058,10 @@
 	function detachFromSourceFile() {
 		midiBuffer = null;
 		isDawprojectFile = false;
+		isGpFile = false;
+		gpSong = null;
+		gpTracks = [];
+		gpTrack = null;
 	}
 
 	// Changing the tuning while authoring keeps the fret numbers (that's
@@ -2065,7 +2268,7 @@
 			const payload = tabParam ?? (await fetchGistPayload(gistParam!));
 			const shared = await decodeShare(
 				payload,
-				(key) => (key in TUNINGS ? TUNINGS[key] : TUNINGS.standard).openNotes
+				(key) => (resolveTuning(key) ?? TUNINGS.standard).openNotes
 			);
 			if (
 				mode === 'author' &&
@@ -2094,7 +2297,7 @@
 		};
 		detachFromSourceFile();
 		mode = 'author';
-		if (shared.tuningKey in TUNINGS) tuningKey = shared.tuningKey as keyof typeof TUNINGS;
+		useTuningKey(shared.tuningKey);
 		tab = opened;
 		history = makeHistory();
 		fileName = null;
@@ -2135,11 +2338,13 @@
 		syncPlayheadToFocus();
 	}
 
-	// Ctrl+C / Ctrl+V: copy the focused bar, paste it over the focused bar.
-	// Notes keep their position in the bar counted in quarter notes, so a
-	// tempo change (or another bar's tempo) still lands them on their beats.
+	// Ctrl+C / Ctrl+V: copy the selected bars (the focused one, or a Shift+
+	// ↑/↓ range), paste them over the bars from the focused one on. Notes keep
+	// their position in the bar counted in quarter notes, so a tempo change
+	// (or another bar's tempo) still lands them on their beats. Copying also
+	// puts the bars on the clipboard as text tab.
 	type BarClip = { notes: TabNote[]; start: number; quarter: number };
-	let barClipboard: BarClip | null = null;
+	let barClipboard: BarClip[] | null = null;
 
 	function barNotes(barIdx: number): BarClip | null {
 		if (!tab) return null;
@@ -2154,16 +2359,42 @@
 	}
 
 	function copyBar() {
-		barClipboard = barNotes(authorFocus.barIdx);
+		if (!tab) return;
+		const [first, last] = selectedBarRange();
+		const clips: BarClip[] = [];
+		for (let b = first; b <= last; b++) {
+			const clip = barNotes(b);
+			if (clip) clips.push(clip);
+		}
+		barClipboard = clips;
+		const bars = first === last ? `bar ${first + 1}` : `bars ${first + 1}–${last + 1}`;
+		const text = tabToAscii(tab, TUNINGS[tuningKey], first, last);
+		navigator.clipboard
+			.writeText(text)
+			.then(() => showNotice(`Copied ${bars} (paste as text tab anywhere)`))
+			.catch(() => showNotice(`Copied ${bars} (here only — the clipboard was blocked)`));
 	}
 
 	function pasteBar() {
-		if (barClipboard) pasteNotes(barClipboard, authorFocus.barIdx, 'Paste bar');
+		if (!tab || !barClipboard?.length) return;
+		const at = authorFocus.barIdx;
+		const label = barClipboard.length > 1 ? `Paste ${barClipboard.length} bars` : 'Paste bar';
+		commitEdit(
+			batchCommand(
+				label,
+				barClipboard.flatMap((clip, i) => pasteCommands(clip, at + i))
+			)
+		);
 	}
 
 	// Put `clip` into bar `barIdx`, replacing what's there.
 	function pasteNotes(clip: BarClip, barIdx: number, label: string) {
 		if (!tab) return;
+		commitEdit(batchCommand(label, pasteCommands(clip, barIdx)));
+	}
+
+	function pasteCommands(clip: BarClip, barIdx: number): Command[] {
+		if (!tab) return [];
 		const bar = barInfo(tab, barIdx);
 		const start = bar.start;
 		const len = bar.length;
@@ -2182,13 +2413,11 @@
 			)
 		}));
 		const extend = extendDurationTo(tab, start + len);
-		commitEdit(
-			batchCommand(label, [
-				...(extend ? [extend] : []),
-				...replaced.map((n) => cmdRemoveNote(n.id)),
-				...pasted.map((n) => cmdAddNote(n))
-			])
-		);
+		return [
+			...(extend ? [extend] : []),
+			...replaced.map((n) => cmdRemoveNote(n.id)),
+			...pasted.map((n) => cmdAddNote(n))
+		];
 	}
 
 	// Derive the [start, end) time range of the current author focus.
@@ -3444,11 +3673,11 @@
 	//   Toggle keys: M palm mute, R let ring (both: every note at that time),
 	//   G ghost, H hammer/pull (direction from the previous note on the
 	//   string), T tap.
-	//   Hold keys: B bend, S slide, V vibrato, N harmonic. Tapping toggles
+	//   Hold keys: B bend, S slide, V vibrato, N harmonic, L trill. Tapping toggles
 	//   (adding uses the last value you set); holding the key and moving the
 	//   mouse adjusts it, and release commits one undo step.
 
-	type HoldArtKey = 'b' | 's' | 'v' | 'n';
+	type HoldArtKey = 'b' | 's' | 'v' | 'n' | 'l';
 	type ArtHold = {
 		key: HoldArtKey;
 		// Physical key (e.code) that started the hold; keyup matches on it.
@@ -3459,8 +3688,8 @@
 		startY: number;
 		moved: boolean;
 		// Starting amount for relative drags: bend semitones (B), slide
-		// origin offset in frets (S, negative = slide up from below), or
-		// index into harmonicChoices (N).
+		// origin offset in frets (S, negative = slide up from below), index
+		// into harmonicChoices (N), or the trill fret's offset (L).
 		base: number;
 		baseRelease: boolean;
 		lastAuditionKey: string;
@@ -3476,6 +3705,7 @@
 		bend: { semitones: number; release: boolean };
 		slideOffset: number;
 		pinchInterval: number;
+		trillOffset: number;
 	};
 	const ART_MEMORY_KEY = 'tabutabu.artMemory';
 	let artMemory: ArtMemory = loadArtMemory();
@@ -3483,7 +3713,8 @@
 		const fallback: ArtMemory = {
 			bend: { semitones: 2, release: false },
 			slideOffset: -2,
-			pinchInterval: 12
+			pinchInterval: 12,
+			trillOffset: 2
 		};
 		try {
 			const raw = typeof localStorage !== 'undefined' && localStorage.getItem(ART_MEMORY_KEY);
@@ -3674,18 +3905,22 @@
 	function toggleArticulationKey(code: string, hit: TabNote): boolean {
 		if (!tab) return false;
 		const has = (k: Articulation['kind']) => hit.articulations.some((a) => a.kind === k);
-		const shapeKinds: Record<string, { kind: 'palmMute' | 'ghost' | 'letRing'; name: string }> = {
+		const shapeKinds: Record<
+			string,
+			{ kind: 'palmMute' | 'ghost' | 'letRing' | 'dead'; name: string }
+		> = {
 			m: { kind: 'palmMute', name: 'palm mute' },
 			g: { kind: 'ghost', name: 'ghost note' },
-			r: { kind: 'letRing', name: 'let ring' }
+			r: { kind: 'letRing', name: 'let ring' },
+			x: { kind: 'dead', name: 'dead note' }
 		};
 		const shape = shapeKinds[code];
 		if (shape) {
 			const on = !has(shape.kind);
-			// PM / let ring: the whole vertical stack. Ghost is per-note
-			// notation, so it only spreads to a power-chord shape.
+			// PM / let ring: the whole vertical stack. Ghost and dead notes
+			// are per-note notation, so they only spread to a power-chord shape.
 			const ids =
-				shape.kind === 'ghost'
+				shape.kind === 'ghost' || shape.kind === 'dead'
 					? [hit.id, ...powerChordGroupFor(hit).map((m) => m.id)]
 					: stackAt(hit.time).map((n) => n.id);
 			const changes = ids.flatMap((id) => {
@@ -3765,6 +4000,10 @@
 			if (s && 'fromSemitones' in s)
 				base = s.kind === 'slideUp' ? -s.fromSemitones : s.fromSemitones;
 			else base = fitSlideOffset(hit.fret, artMemory.slideOffset);
+		} else if (key === 'l') {
+			const t = arts.find((a) => a.kind === 'trill');
+			base =
+				t?.kind === 'trill' ? t.semitones : fitSlideOffset(hit.fret, artMemory.trillOffset) || 2;
 		} else if (key === 'n') {
 			const h = arts.find((a) => a.kind === 'harmonic');
 			const i = h && 'semitones' in h ? harmonicChoices(hit.fret).indexOf(h.semitones) : -1;
@@ -3844,6 +4083,22 @@
 					{ kind: 'harmonic', semitones, pinch: !isNaturalHarmonic(note.fret, semitones) }
 				];
 			}
+		} else if (h.key === 'l') {
+			// Trill: only the other fret is edited (it alternates with the note).
+			const rest = withoutArts(b, 'trill');
+			const had = rest.length !== b.length;
+			const old = b.find((a) => a.kind === 'trill');
+			let offset: number;
+			if (!h.moved) offset = had ? 0 : h.base;
+			else offset = h.base + Math.round(dx / PX_PER_FRET);
+			offset = Math.max(0, Math.min(MAX_FRET, note.fret + offset)) - note.fret;
+			next =
+				offset === 0
+					? rest
+					: [
+							...rest,
+							{ kind: 'trill', semitones: offset, rate: old?.kind === 'trill' ? old.rate : 32 }
+						];
 		} else {
 			const rest = withoutArts(b, 'vibrato');
 			const had = rest.length !== b.length;
@@ -3891,13 +4146,15 @@
 			else if (h.key === 's' && a.kind === 'slideDown') artMemory.slideOffset = a.fromSemitones;
 			else if (h.key === 'n' && a.kind === 'harmonic' && a.pinch)
 				artMemory.pinchInterval = a.semitones;
+			else if (h.key === 'l' && a.kind === 'trill') artMemory.trillOffset = a.semitones;
 		}
 		saveArtMemory();
 		const labels: Record<HoldArtKey, string> = {
 			b: 'Edit bend',
 			s: 'Edit slide',
 			v: 'Edit vibrato',
-			n: 'Edit harmonic'
+			n: 'Edit harmonic',
+			l: 'Edit trill'
 		};
 		commitEdit(
 			batchCommand(labels[h.key], [cmdUpdateNote(h.noteId, { articulations: [...final] })])
@@ -3945,7 +4202,12 @@
 		// text label — the bar number is already drawn at the top of the
 		// bar by the renderer, and the colour tells you which mode you're
 		// in.
-		const focus = authorFocusRange();
+		let focus = authorFocusRange();
+		if (barSelectAnchor !== null) {
+			const [first, last] = selectedBarRange();
+			const lastBar = barInfo(tab, last);
+			focus = { start: barInfo(tab, first).start, end: lastBar.start + lastBar.length };
+		}
 		if (focus.end > pageStart && focus.start < pageEnd + peekDur) {
 			const fx0 = timeToX(Math.max(pageStart, focus.start));
 			const fx1 = timeToX(Math.min(pageEnd + peekDur, focus.end));
@@ -6030,6 +6292,16 @@
 		tctx.fillStyle = '#1c2734';
 		tctx.fillRect(0, 0, xForTime(currentTime), h);
 
+		// Bars selected with Shift+↑/↓ (author mode).
+		if (mode === 'author' && barSelectAnchor !== null) {
+			const [first, last] = selectedBarRange();
+			const lastBar = barInfo(tabRef, last);
+			const x0 = xForTime(barInfo(tabRef, first).start);
+			const x1 = xForTime(lastBar.start + lastBar.length);
+			tctx.fillStyle = 'rgba(80, 160, 240, 0.28)';
+			tctx.fillRect(x0, 0, Math.max(2, x1 - x0), h);
+		}
+
 		// Beat lines (thin, subtle)
 		tctx.strokeStyle = '#232c36';
 		tctx.lineWidth = 1;
@@ -6129,7 +6401,7 @@
 			if (th === 'dark' || th === 'light') theme = th;
 			stringFlashEnabled = b('tabutabu.stringFlashEnabled', stringFlashEnabled);
 			const tk = localStorage.getItem('tabutabu.tuningKey');
-			if (tk && tk in TUNINGS) tuningKey = tk as keyof typeof TUNINGS;
+			if (tk) useTuningKey(tk);
 			// Restore the active author tool.
 			const savedTool = Number(localStorage.getItem('tabutabu.currentTool'));
 			if ([0, 1, 2, 3, 4, 5, 6].includes(savedTool) && localStorage.getItem('tabutabu.currentTool'))
@@ -6201,6 +6473,8 @@
 			const savedStyle = localStorage.getItem('tabutabu.spectroStyle');
 			if (savedStyle === 'spectrum' || savedStyle === 'plain') spectroStyle = savedStyle;
 			muteRefInBackground = localStorage.getItem('tabutabu.muteRefInBackground') === '1';
+			const span = Number(localStorage.getItem('tabutabu.splitSpan'));
+			if (SPLIT_SPANS.includes(span)) splitSpan = span;
 			const savedListen = localStorage.getItem('tabutabu.listenChannel');
 			if (savedListen === 'left' || savedListen === 'right') listenChannel = savedListen;
 			// Grid (incl. triplets). Unknown values fall back to the default.
@@ -6352,6 +6626,7 @@
 	$effect(() => put('tabutabu.refView', refView));
 	$effect(() => put('tabutabu.spectroChannel', spectroChannel));
 	$effect(() => put('tabutabu.listenChannel', listenChannel));
+	$effect(() => put('tabutabu.splitSpan', String(splitSpan)));
 	$effect(() => put('tabutabu.muteRefInBackground', muteRefInBackground ? '1' : '0'));
 	$effect(() => put('tabutabu.spectroStyle', spectroStyle));
 	$effect(() => put('tabutabu.videoVolume', String(videoVolume)));
@@ -6587,7 +6862,7 @@
 						return;
 					}
 				}
-				if (/^[bghmnrstv]$/.test(k) && hoverPos && !authorGesture && tab) {
+				if (/^[bghlmnrstvx]$/.test(k) && hoverPos && !authorGesture && tab) {
 					if (artHold || e.repeat) {
 						e.preventDefault();
 						return;
@@ -6595,7 +6870,7 @@
 					const hit = findAuthorNoteAt(hoverPos);
 					if (hit) {
 						e.preventDefault();
-						if (k === 'b' || k === 's' || k === 'v' || k === 'n') {
+						if (k === 'b' || k === 's' || k === 'v' || k === 'n' || k === 'l') {
 							beginArtHold(k, hit, e.code);
 						} else {
 							toggleArticulationKey(k, hit);
@@ -6672,6 +6947,16 @@
 				if (currentTool === 6 && e.shiftKey) {
 					// Sweep tool: Shift+↓ next pattern, Shift+↑ previous.
 					sweepAction({ kind: 'pattern', dir: e.code === 'ArrowDown' ? 1 : -1 });
+					return;
+				}
+				if (e.shiftKey) {
+					// Shift+↓/↑: select one bar more / fewer (from where it began).
+					const anchor = barSelectAnchor ?? authorFocus.barIdx;
+					const nextBar = Math.max(0, authorFocus.barIdx + (e.code === 'ArrowDown' ? 1 : -1));
+					extendingBarSelection = true;
+					barSelectAnchor = anchor;
+					authorFocus = { barIdx: nextBar, beatIdx: 0 };
+					syncPlayheadToFocus();
 					return;
 				}
 				// Down = next bar (whole-bar focus), Up = previous bar — or, with
@@ -6826,10 +7111,10 @@
 					<div class="menu-panel">
 						<label class="menu-item file-pick">
 							<span class="i-lucide-file-music"></span>
-							<span>Open MIDI / .dawproject…</span>
+							<span>Open MIDI / Guitar Pro / .dawproject…</span>
 							<input
 								type="file"
-								accept=".mid,.midi,.dawproject,audio/midi"
+								accept=".mid,.midi,.dawproject,.gp,.gp3,.gp4,.gp5,.gpx,audio/midi"
 								onchange={(e) => {
 									openMenu = null;
 									onFile(e);
@@ -6845,6 +7130,9 @@
 									fileName = null;
 									tab = null;
 									midiBuffer = null;
+									gpSong = null;
+									gpTracks = [];
+									gpTrack = null;
 									openMenu = null;
 								}}
 							>
@@ -7018,10 +7306,27 @@
 				<button class:open={openMenu === 'tab'} onclick={() => toggleMenu('tab')}>Tab</button>
 				{#if openMenu === 'tab'}
 					<div class="menu-panel form">
+						{#if gpTracks.length > 0}
+							<label title="The Guitar Pro file's track shown as the tab (6-string tracks only)">
+								<span>Track</span>
+								<select
+									value={gpTrack}
+									onchange={(e) => selectGpTrack(Number(e.currentTarget.value))}
+								>
+									{#each gpTracks as t (t.index)}
+										<option value={t.index} disabled={!!t.unsupported}>
+											{t.index + 1}. {t.name}{t.unsupported
+												? ` — ${t.unsupported}`
+												: ` — ${t.tuningName || 'Standard'}`}
+										</option>
+									{/each}
+								</select>
+							</label>
+						{/if}
 						<label>
 							<span>Tuning</span>
 							<select bind:value={tuningKey}>
-								{#each Object.entries(TUNINGS) as [key, t] (key)}
+								{#each tuningList as [key, t] (key)}
 									<option value={key}>{t.name}</option>
 								{/each}
 							</select>
@@ -7581,12 +7886,34 @@
 										<button
 											class:on={spectroChannel === stem}
 											onclick={() => setSpectroChannel(stem)}
-											title={`Only the ${stem}, split out of the song`}
+											title={stems.range
+												? `Only the ${stem}, split out of ${rangeLabel(stems.range)} (silent elsewhere)`
+												: `Only the ${stem}, split out of the song`}
 										>
 											{stem[0].toUpperCase() + stem.slice(1)}
 										</button>
 									{/each}
+									<button
+										class="resplit"
+										onclick={splitAgain}
+										title={`Split again — another stretch or the whole song (this split: ${stems.range ? rangeLabel(stems.range) : 'whole song'})`}
+										aria-label="Split again"
+									>
+										<span class="i-lucide-rotate-ccw"></span>
+									</button>
 								{:else if stemsAvailable}
+									<select
+										class="split-span"
+										bind:value={splitSpan}
+										disabled={stems?.status === 'running'}
+										title="How much to split: the whole song, or a stretch from the offset (where the tab starts). Shorter is much faster."
+									>
+										{#each SPLIT_SPANS as span (span)}
+											<option value={span}
+												>{span === 0 ? 'Whole song' : `${span / 60} min from offset`}</option
+											>
+										{/each}
+									</select>
 									<button
 										class="split"
 										disabled={stems?.status === 'running'}
@@ -7891,7 +8218,7 @@
 			MIDI inspector) are under Tab → File details. -->
 			<p class="status">
 				{#if parseError}
-					<span class="err">Failed to parse MIDI: {parseError}</span>
+					<span class="err">Couldn't open the file: {parseError}</span>
 				{:else if tab}
 					{#if fileName}<span class="mono">{fileName}</span> ·
 					{/if}
@@ -7963,6 +8290,8 @@
 							<dd>pick slide (whole moment)</dd>
 							<dt>G</dt>
 							<dd>ghost</dd>
+							<dt>X</dt>
+							<dd>dead note</dd>
 							<dt>H</dt>
 							<dd>hammer-on / pull-off</dd>
 							<dt>T</dt>
@@ -7975,6 +8304,8 @@
 							<dd>vibrato: → length</dd>
 							<dt>N hold</dt>
 							<dd>harmonic: ←/→ interval</dd>
+							<dt>L hold</dt>
+							<dd>trill: ←/→ the fret it trills to</dd>
 						</dl>
 					</section>
 					<section>
@@ -7992,8 +8323,10 @@
 							<dd>undo / redo</dd>
 							<dt>Ctrl+D</dt>
 							<dd>copy the bar into the next bar</dd>
+							<dt>Shift+↑/↓</dt>
+							<dd>select more bars</dd>
 							<dt>Ctrl+C / V</dt>
-							<dd>copy the bar / paste over the bar</dd>
+							<dd>copy the bar(s), also as text tab / paste over the bar(s)</dd>
 						</dl>
 					</section>
 					<section>
@@ -8082,7 +8415,7 @@
 				<label>
 					<span>Tuning</span>
 					<select bind:value={tuningKey}>
-						{#each Object.entries(TUNINGS) as [key, t] (key)}
+						{#each tuningList as [key, t] (key)}
 							<option value={key}>{t.name}</option>
 						{/each}
 					</select>
@@ -8194,6 +8527,10 @@
 		</div>
 	{/if}
 </div>
+
+{#if notice}
+	<div class="notice" role="status">{notice}</div>
+{/if}
 
 <style>
 	:global(html, body) {
@@ -8588,6 +8925,21 @@
 		   width × (9/16 × scale + 260/1280) ≤ height − chrome. */
 		width: min(100%, 1280px, calc((100vh - 270px) / (0.5625 * var(--ref-scale, 1) + 0.203)));
 	}
+	.notice {
+		position: fixed;
+		left: 50%;
+		bottom: 28px;
+		transform: translateX(-50%);
+		z-index: 50;
+		padding: 8px 14px;
+		border-radius: 8px;
+		background: #1c2530;
+		border: 1px solid #2f3c4b;
+		color: #e6eef7;
+		font-size: 13px;
+		pointer-events: none;
+		box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+	}
 	.transport {
 		display: flex;
 		align-items: center;
@@ -8835,6 +9187,24 @@
 	}
 	.spectro-channel button.split {
 		min-width: 92px;
+	}
+	.spectro-channel .split-span {
+		background: transparent;
+		border: none;
+		border-right: 1px solid #232c36;
+		border-radius: 0;
+		color: #8a99ad;
+		font-size: 11.5px;
+		font-weight: 600;
+		padding: 0 4px;
+	}
+	.spectro-channel .split-span option {
+		background: #0e141a;
+	}
+	.spectro-channel button.resplit {
+		padding: 2px 7px;
+		display: inline-flex;
+		align-items: center;
 	}
 	.spectro-channel button.on {
 		background: #2a3644;

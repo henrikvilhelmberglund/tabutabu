@@ -224,6 +224,11 @@ export class Synth {
 				const nextSame = nextOnStringAfter.get(n.id) ?? Infinity;
 				rawEndSong = Math.min(nextGlobal, nextSame, barEnd);
 			}
+			// Staccato keeps to its written length; a dead note is a click.
+			if (n.articulations?.some((a) => a.kind === 'staccato'))
+				rawEndSong = Math.min(rawEndSong, n.time + n.duration);
+			if (n.articulations?.some((a) => a.kind === 'dead'))
+				rawEndSong = Math.min(rawEndSong, n.time + 0.06);
 			const noteCtxEnd = ctxStart + (rawEndSong - fromSongTime);
 			if (before) {
 				// A let ring from before the window, still ringing: it fades in
@@ -244,8 +249,39 @@ export class Synth {
 					ctxStart,
 					noteCtxEnd,
 					chordLevel(chordSize.get(n.id) ?? 1),
-					true
+					true,
+					60 / bar.bpm
 				);
+				continue;
+			}
+			const tremolo = n.articulations?.find((a) => a.kind === 'tremolo');
+			if (tremolo?.kind === 'tremolo' && tremolo.rate > 0) {
+				// Tremolo picking: re-picked every 1/rate note for as long
+				// as it rings.
+				const step = ((60 / bar.bpm) * 4) / tremolo.rate;
+				const end = Math.max(noteCtxStart + 0.05, noteCtxEnd);
+				const repick: TabNote = {
+					...n,
+					articulations: n.articulations.filter(
+						(a) =>
+							a.kind !== 'tremolo' &&
+							a.kind !== 'slideUp' &&
+							a.kind !== 'slideDown' &&
+							a.kind !== 'graceSlide'
+					)
+				};
+				for (let t = noteCtxStart, i = 0; t < end - step * 0.5; t += step, i++) {
+					this.scheduleVoice(
+						ctx,
+						master,
+						i === 0 ? n : repick,
+						t,
+						Math.min(end, t + step),
+						chordLevel(chordSize.get(n.id) ?? 1),
+						false,
+						60 / bar.bpm
+					);
+				}
 				continue;
 			}
 			this.scheduleVoice(
@@ -254,7 +290,9 @@ export class Synth {
 				n,
 				noteCtxStart,
 				Math.max(noteCtxStart + 0.05, noteCtxEnd),
-				chordLevel(chordSize.get(n.id) ?? 1)
+				chordLevel(chordSize.get(n.id) ?? 1),
+				false,
+				60 / bar.bpm
 			);
 		}
 
@@ -415,12 +453,17 @@ export class Synth {
 		level = 1,
 		// Already sounding (a let ring carried into the playback window):
 		// fade in instead of a plucked attack.
-		fadeIn = false
+		fadeIn = false,
+		// Length of a quarter note here (for trill speed).
+		quarterSec = 0.5
 	): Voice {
 		const arts = note.articulations ?? [];
 		const has = (kind: Articulation['kind']) => arts.some((a) => a.kind === kind);
 		if (has('pickSlide')) {
 			return this.schedulePickSlide(ctx, master, note, startCtxTime, endCtxTime, level);
+		}
+		if (has('dead')) {
+			return this.scheduleDeadNote(ctx, master, note, startCtxTime, level);
 		}
 
 		// Harmonic sounds one octave (or 12+N semitones) above the fretted note.
@@ -440,7 +483,7 @@ export class Synth {
 		osc.frequency.value = baseFreq;
 
 		// Pitch modulation via detune (cents).
-		this.schedulePitchCurve(osc, arts, startCtxTime, endCtxTime);
+		this.schedulePitchCurve(osc, arts, startCtxTime, endCtxTime, quarterSec);
 
 		const gain = ctx.createGain();
 		this.scheduleAmplitudeEnvelope(gain, note, arts, startCtxTime, endCtxTime, level, fadeIn);
@@ -534,6 +577,50 @@ export class Synth {
 		return voice;
 	}
 
+	// Dead note: the string muted under the fingers — a short, dull click
+	// around the string's pitch, no tone.
+	private scheduleDeadNote(
+		ctx: AudioContext,
+		master: GainNode,
+		note: TabNote,
+		start: number,
+		level: number
+	): Voice {
+		const stop = start + 0.05;
+		const noise = ctx.createBufferSource();
+		noise.buffer = this.noiseBuffer(ctx);
+		const band = ctx.createBiquadFilter();
+		band.type = 'bandpass';
+		band.Q.value = 2.5;
+		band.frequency.value = Math.min(midiToFreq(note.midi) * 3, 3000);
+		const gain = ctx.createGain();
+		const peak = 0.9 * note.velocity * level;
+		gain.gain.setValueAtTime(0, start);
+		gain.gain.linearRampToValueAtTime(peak, start + 0.002);
+		gain.gain.exponentialRampToValueAtTime(peak * 0.05, stop - 0.005);
+		gain.gain.linearRampToValueAtTime(0, stop);
+		noise.connect(band);
+		band.connect(gain);
+		gain.connect(master);
+		// A muted thump under the click.
+		const osc = ctx.createOscillator();
+		osc.type = 'triangle';
+		osc.frequency.value = midiToFreq(note.midi);
+		const thump = ctx.createGain();
+		thump.gain.setValueAtTime(0, start);
+		thump.gain.linearRampToValueAtTime(0.25 * note.velocity * level, start + 0.002);
+		thump.gain.exponentialRampToValueAtTime(0.001, stop);
+		osc.connect(thump);
+		thump.connect(master);
+		noise.start(start);
+		noise.stop(stop + 0.02);
+		osc.start(start);
+		osc.stop(stop + 0.02);
+		const voice: Voice = { osc, gain, noise, endsAtCtxTime: stop };
+		this.voices.push(voice);
+		return voice;
+	}
+
 	// One second of white noise, made once per audio context.
 	private noiseCache: { ctx: BaseAudioContext; buffer: AudioBuffer } | null = null;
 	private noiseBuffer(ctx: BaseAudioContext): AudioBuffer {
@@ -549,7 +636,8 @@ export class Synth {
 		osc: OscillatorNode,
 		arts: Articulation[],
 		start: number,
-		end: number
+		end: number,
+		quarterSec = 0.5
 	): void {
 		const bend = arts.find((a) => a.kind === 'bend');
 		const bendRelease = arts.find((a) => a.kind === 'bendRelease');
@@ -587,6 +675,48 @@ export class Synth {
 		} else if (slideDown) {
 			osc.detune.setValueAtTime(slideDown.fromSemitones * 100, start);
 			osc.detune.linearRampToValueAtTime(0, start + SLIDE_TIME);
+		}
+		const prebend = arts.find((a) => a.kind === 'prebend');
+		if (prebend?.kind === 'prebend') {
+			// Picked already bent; a release lets it down by mid-note.
+			const peak = prebend.semitones * 100;
+			osc.detune.setValueAtTime(peak, start);
+			if (prebend.release) {
+				const releaseStart = start + dur * 0.35;
+				osc.detune.setValueAtTime(peak, releaseStart);
+				osc.detune.linearRampToValueAtTime(0, Math.min(end, releaseStart + BEND_TIME));
+			}
+		}
+		const whammy = arts.find((a) => a.kind === 'whammy');
+		if (whammy?.kind === 'whammy' && whammy.points.length > 0) {
+			// The bar's curve over the note (on top of a bend or slide).
+			const base = bend ? bend.semitones * 100 : 0;
+			const [first, ...rest] = whammy.points;
+			osc.detune.setValueAtTime(base + first[1] * 100, start + first[0] * dur);
+			for (const [at, semitones] of rest)
+				osc.detune.linearRampToValueAtTime(base + semitones * 100, start + at * dur);
+		}
+		const trill = arts.find((a) => a.kind === 'trill');
+		if (trill?.kind === 'trill' && trill.semitones !== 0) {
+			// Hammered to the other fret and pulled back, over and over: at
+			// the written speed, but never slower than 14 notes a second.
+			const step = Math.min((quarterSec * 4) / (trill.rate || 32), 1 / 14);
+			const other = trill.semitones * 100;
+			const glide = Math.min(0.004, step / 4);
+			let onOther = false;
+			for (let t = start + step; t < end - glide; t += step) {
+				onOther = !onOther;
+				osc.detune.setValueAtTime(onOther ? 0 : other, t);
+				osc.detune.linearRampToValueAtTime(onOther ? other : 0, t + glide);
+			}
+		}
+		const slideOut = arts.find((a) => a.kind === 'slideOut');
+		if (slideOut?.kind === 'slideOut') {
+			// Slides off up / down an octave-ish over the last part.
+			const from = Math.max(start, end - Math.min(0.18, dur * 0.5));
+			const held = bend ? bend.semitones * 100 : 0;
+			osc.detune.setValueAtTime(held, from);
+			osc.detune.linearRampToValueAtTime(held + (slideOut.up ? 700 : -900), end);
 		}
 	}
 

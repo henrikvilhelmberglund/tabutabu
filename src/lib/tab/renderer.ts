@@ -309,7 +309,7 @@ function renderPage(
 	// then current, so hits at the boundary land on top of the peek.
 	const usableHeight = height - paddingTop - paddingBottom;
 	const stringGap = usableHeight / (STRING_COUNT - 1);
-	const durToW = (dur: number) => dur * pxPerSec;
+	const durToW = (_t: number, dur: number) => dur * pxPerSec;
 
 	if (peekDur > 0) {
 		ctx.globalAlpha = 0.5;
@@ -608,6 +608,8 @@ function drawNotes(
 //          is an octave pinch harmonic picked 12 frets above the fret.
 //          Same convention as artificial harmonics.
 //   bN     bend to fret N; bNrM bend and release
+//   pbN    pre-bend to fret N; pbNrM pre-bend and release
+//   (N)    trill with fret N
 //   \N     grace slide back down
 function noteSuffix(n: import('./types').TabNote): string {
 	const arts = n.articulations ?? [];
@@ -617,6 +619,9 @@ function noteSuffix(n: import('./types').TabNote): string {
 	for (const a of arts) {
 		if (a.kind === 'bend') s += `b${n.fret + a.semitones}`;
 		else if (a.kind === 'bendRelease') s += `b${n.fret + a.semitones}r${n.fret}`;
+		else if (a.kind === 'trill') s += `(${n.fret + a.semitones})`;
+		else if (a.kind === 'prebend')
+			s += `pb${n.fret + a.semitones}${a.release ? `r${n.fret}` : ''}`;
 	}
 	const grace = arts.find((a) => a.kind === 'graceSlide');
 	if (grace?.kind === 'graceSlide') s += `\\${Math.max(0, n.fret - grace.fromSemitones)}`;
@@ -650,7 +655,7 @@ function drawNoteWithArticulations(
 
 	const ghost = has('ghost');
 	const harmonic = arts.find((a) => a.kind === 'harmonic');
-	let fretLabel = String(n.fret);
+	let fretLabel = has('dead') ? 'x' : String(n.fret);
 	if (ghost) fretLabel = `(${fretLabel})`;
 	// Natural harmonics get <n>; pinch harmonics get a "P.H." label above
 	// the staff instead (drawPinchHarmonicMarkers).
@@ -669,8 +674,23 @@ function drawNoteWithArticulations(
 		(has('hammerOn') || has('pullOff')) &&
 		prevOnString !== null &&
 		n.time - prevOnString.time <= 1.5;
+	// A slide from the previous note on the string (it's the slide's start
+	// fret): a line from that note instead of repeating its fret.
+	const slideFrom = slideUp
+		? n.fret - slideUp.fromSemitones
+		: slideDown
+			? n.fret + slideDown.fromSemitones
+			: null;
+	const slideFromPrev =
+		slideFrom !== null &&
+		prevOnString !== null &&
+		prevOnString.fret === slideFrom &&
+		!prevOnString.articulations?.some((a) => a.kind === 'dead') &&
+		n.time - prevOnString.time <= 1.5;
 	let prefix = '';
-	if (slideUp) {
+	if (slideFromPrev) {
+		// Drawn below as a line from the previous note.
+	} else if (slideUp) {
 		const from = Math.max(0, n.fret - slideUp.fromSemitones);
 		prefix = `${from}`;
 	} else if (slideDown) {
@@ -701,7 +721,7 @@ function drawNoteWithArticulations(
 	// actual played fret sits over the beat line regardless of suffix/prefix.
 	// Slide notation needs a small gap between the origin fret and the played
 	// fret so the diagonal line has room to render between them.
-	const slideSpace = slideUp || slideDown ? 12 : 0;
+	const slideSpace = (slideUp || slideDown) && !slideFromPrev ? 12 : 0;
 	const fretStartX = x - fretW / 2;
 	const prefixStartX = fretStartX - prefixW - slideSpace;
 	const suffixStartX = fretStartX + fretW;
@@ -849,9 +869,112 @@ function drawNoteWithArticulations(
 		ctx.stroke();
 	}
 
+	// Slide from the previous note: a diagonal from that note to this one.
+	if (pass === 'text' && slideFromPrev && prevOnString) {
+		ctx.font = fretFont;
+		const prevW = ctx.measureText(String(prevOnString.fret)).width;
+		const prevSuffix = noteSuffix(prevOnString);
+		const prevSuffixW = prevSuffix ? ctx.measureText(prevSuffix).width : 0;
+		const lineX0 = timeToX(prevOnString.time) + prevW / 2 + prevSuffixW + 3;
+		const lineX1 = fretStartX - 3;
+		if (lineX1 > lineX0 + 2) {
+			ctx.strokeStyle = decoColor;
+			ctx.lineWidth = 1.2;
+			ctx.beginPath();
+			ctx.moveTo(lineX0, y + (slideUp ? 5 : -5));
+			ctx.lineTo(lineX1, y + (slideUp ? -5 : 5));
+			ctx.stroke();
+		}
+	}
+
+	// Slide out of the note to nowhere: a short line rising or falling
+	// after it.
+	const slideOut = arts.find((a) => a.kind === 'slideOut');
+	if (pass === 'text' && slideOut) {
+		const x0 = suffixStartX + suffixW + 3;
+		const x1 = x0 + 12;
+		ctx.strokeStyle = decoColor;
+		ctx.lineWidth = 1.2;
+		ctx.beginPath();
+		ctx.moveTo(x0, y + (slideOut.up ? 4 : -4));
+		ctx.lineTo(x1, y + (slideOut.up ? -6 : 6));
+		ctx.stroke();
+	}
+
+	// Staccato: a dot under the fret.
+	if (pass === 'text' && has('staccato')) {
+		ctx.fillStyle = decoColor;
+		ctx.beginPath();
+		ctx.arc(fretStartX + fretW / 2, y + 12, 1.8, 0, Math.PI * 2);
+		ctx.fill();
+	}
+
+	// Tremolo picking: one slash per beam (8th 1, 16th 2, 32nd 3) above.
+	const tremolo = arts.find((a) => a.kind === 'tremolo');
+	if (pass === 'text' && tremolo) {
+		const count = tremolo.rate >= 32 ? 3 : tremolo.rate >= 16 ? 2 : 1;
+		const cx = fretStartX + fretW / 2;
+		ctx.strokeStyle = decoColor;
+		ctx.lineWidth = 1.6;
+		ctx.beginPath();
+		for (let i = 0; i < count; i++) {
+			const sy = y - 13 - i * 4;
+			ctx.moveTo(cx - 4, sy + 1.5);
+			ctx.lineTo(cx + 4, sy - 1.5);
+		}
+		ctx.stroke();
+	}
+
+	// Trill: "tr" and a wavy line over the note.
+	const trill = arts.find((a) => a.kind === 'trill');
+	if (pass === 'text' && trill) {
+		const ty = y - 15;
+		ctx.font = decorFont;
+		ctx.fillStyle = decoColor;
+		ctx.textBaseline = 'middle';
+		ctx.fillText('tr', fretStartX, ty);
+		const wx0 = fretStartX + ctx.measureText('tr').width + 3;
+		const wx1 = Math.max(wx0 + 24, x + durationPx - 14);
+		const period = 8;
+		const cycles = Math.max(1, Math.round((wx1 - wx0) / period));
+		ctx.strokeStyle = decoColor;
+		ctx.lineWidth = 1.2;
+		ctx.beginPath();
+		for (let i = 0; i <= cycles * 6; i++) {
+			const t = i / (cycles * 6);
+			const px = wx0 + t * (wx1 - wx0);
+			const py = ty + Math.sin(t * cycles * Math.PI * 2) * 2.5;
+			if (i === 0) ctx.moveTo(px, py);
+			else ctx.lineTo(px, py);
+		}
+		ctx.stroke();
+	}
+
+	// Whammy bar: its pitch curve, drawn over the note above the fret.
+	const whammy = arts.find((a) => a.kind === 'whammy');
+	if (pass === 'text' && whammy && whammy.points.length > 0) {
+		const wx0 = fretStartX;
+		const width = Math.max(24, durationPx - 40);
+		const baseY = y - 21;
+		ctx.strokeStyle = decoColor;
+		ctx.lineWidth = 1.2;
+		ctx.beginPath();
+		whammy.points.forEach(([at, semitones], i) => {
+			const px = wx0 + at * width;
+			const py = baseY - Math.max(-9, Math.min(9, semitones * 4));
+			if (i === 0) ctx.moveTo(px, py);
+			else ctx.lineTo(px, py);
+		});
+		ctx.stroke();
+		ctx.font = decorFont;
+		ctx.fillStyle = decoColor;
+		ctx.textBaseline = 'middle';
+		ctx.fillText('w/b', wx0 + width + 3, baseY);
+	}
+
 	// Slide connector — thin diagonal line spanning the slideSpace gap between
 	// the origin fret text and the played fret text on the same string.
-	if (pass === 'text' && (slideUp || slideDown)) {
+	if (pass === 'text' && (slideUp || slideDown) && !slideFromPrev) {
 		const lineX0 = prefixStartX + prefixW + 2;
 		const lineX1 = fretStartX - 2;
 		if (lineX1 > lineX0 + 2) {

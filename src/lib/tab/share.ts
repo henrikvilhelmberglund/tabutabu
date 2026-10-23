@@ -50,7 +50,16 @@ const CODE = {
 	harmonic: 12,
 	pinchHarmonic: 13,
 	vibrato: 14,
-	pickSlide: 15
+	pickSlide: 15,
+	dead: 16,
+	staccato: 17,
+	tremolo: 18,
+	slideOutUp: 19,
+	slideOutDown: 20,
+	prebend: 21,
+	prebendRelease: 22,
+	whammy: 23,
+	trill: 24
 } as const;
 
 // ---- bytes -----------------------------------------------------------------
@@ -135,6 +144,31 @@ function writeArticulation(
 			w.u8(a.pinch ? CODE.pinchHarmonic : CODE.harmonic);
 			w.u8(a.semitones);
 			break;
+		case 'tremolo':
+			w.u8(CODE.tremolo);
+			w.u8(a.rate);
+			break;
+		case 'slideOut':
+			w.u8(a.up ? CODE.slideOutUp : CODE.slideOutDown);
+			break;
+		case 'prebend':
+			w.u8(a.release ? CODE.prebendRelease : CODE.prebend);
+			w.u8(a.semitones);
+			break;
+		case 'trill':
+			w.u8(CODE.trill);
+			w.zz(a.semitones);
+			w.u8(a.rate);
+			break;
+		case 'whammy':
+			// Points: position in 1/60ths of the note, quarter tones.
+			w.u8(CODE.whammy);
+			w.u8(a.points.length);
+			for (const [at, semitones] of a.points) {
+				w.u8(at * 60);
+				w.zz(semitones * 2);
+			}
+			break;
 		case 'vibrato': {
 			w.u8(CODE.vibrato);
 			const start = toTicks(a.startTime);
@@ -168,6 +202,28 @@ function readArticulation(
 			return { kind: 'letRing' };
 		case CODE.pickSlide:
 			return { kind: 'pickSlide' };
+		case CODE.dead:
+			return { kind: 'dead' };
+		case CODE.staccato:
+			return { kind: 'staccato' };
+		case CODE.tremolo:
+			return { kind: 'tremolo', rate: r.u8() };
+		case CODE.slideOutUp:
+			return { kind: 'slideOut', up: true };
+		case CODE.slideOutDown:
+			return { kind: 'slideOut', up: false };
+		case CODE.prebend:
+			return { kind: 'prebend', semitones: r.u8(), release: false };
+		case CODE.prebendRelease:
+			return { kind: 'prebend', semitones: r.u8(), release: true };
+		case CODE.trill:
+			return { kind: 'trill', semitones: r.zz(), rate: r.u8() };
+		case CODE.whammy: {
+			const count = r.u8();
+			const points: Array<[number, number]> = [];
+			for (let i = 0; i < count; i++) points.push([r.u8() / 60, r.zz() / 2]);
+			return { kind: 'whammy', points };
+		}
 		case CODE.slideUp:
 			return { kind: 'slideUp', fromSemitones: r.u8() };
 		case CODE.slideDown:

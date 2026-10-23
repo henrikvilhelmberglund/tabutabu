@@ -31,6 +31,25 @@ export type Articulation =
 	// Pick slide ("P.S."): the pick scraped down the strings from this note,
 	// instead of picking it.
 	| { kind: 'pickSlide' }
+	// Dead (muted) note: "x", a percussive click with no pitch.
+	| { kind: 'dead' }
+	// Staccato: cut short (played for its written length only).
+	| { kind: 'staccato' }
+	// Tremolo picking: re-picked at this note value (8 = eighths, 16, 32)
+	// for as long as the note lasts.
+	| { kind: 'tremolo'; rate: number }
+	// Slide out of the note to nowhere, up or down, at its end.
+	| { kind: 'slideOut'; up: boolean }
+	// Pre-bend: picked already bent up N semitones; `release` lets it back
+	// down to the fret during the note.
+	| { kind: 'prebend'; semitones: number; release: boolean }
+	// Trill: alternates fast with the fret `semitones` away (hammered and
+	// pulled) for as long as the note rings; `rate` is the written speed
+	// (16 = sixteenths, 32, 64).
+	| { kind: 'trill'; semitones: number; rate: number }
+	// Whammy bar: pitch curve over the note, [fraction of the note 0–1,
+	// semitones (negative = down)].
+	| { kind: 'whammy'; points: Array<[number, number]> }
 	// Note is "let ring" — playback keeps the pitch alive past the bar
 	// boundary (the default is to mute at bar end), and it's cut only by
 	// the next note fretted on the SAME string, mirroring real guitar
